@@ -1,7 +1,8 @@
-// CanvasBar — macOS 菜单栏 Canvas 课业同步工作台 (v2.7)
+// CanvasBar — macOS 菜单栏 Canvas 课业同步工作台 (v2.8)
 // 课程列表 → 一键开同步文件夹 / 在 Canvas 打开课程页；自动同步 Canvas 材料（模块 ∪ 公告附件 ∪ 页面正文引用，含 front_page）→ ~/Documents/Canvas 同步/<课程>/；
 // 库内去重；跳过视频/大文件（保留在线链接）；DDL 可标记已提交/手动添加（选课程+日期）；每课新内容角标；按课程勾选同步；课程子菜单列出已同步文件（悬停展开、点击直开）+ 在 Canvas 打开课程；开机自启；应用图标（Canvas 花标，对话框/Finder 显示）
 // v2.7：子菜单按用户整理的文件夹结构展示（磁盘实时扫描）；子菜单可「关闭/恢复该课程同步」（关闭需确认，已下载文件保留）；单独同步某课程；登录窗健壮化（弹窗/重定向收敛到应用内、SAML 递交协助、登录态 Cookie 变化检测、登录窗手动关闭回退）
+// v2.8：登录态持久化——会话检查「快路 + SSO 静默重登」（Canvas session 过期时靠 ADFS 持久 cookie 自动回流，不再动辄弹登录窗）；30 分钟心跳保活（应用运行期间会话不再空闲过期）；登录页「保持登录」复选框自动勾选
 // 运行时配置：~/Library/Application Support/CanvasBar/config.json（Canvas 域名，便于分发他机使用）
 import AppKit
 import SwiftUI
@@ -797,6 +798,8 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     var loginVerifyBusy = false
     var loginVerifyAt: Date?
     var loginFinished = false
+    var lastNavError: String?
+    var lastNavErrorAt: Date?
 
     // base64 分片回退下载用
     var chunks: [Int64: [Int: String]] = [:]
@@ -857,6 +860,7 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
             log("登录窗 page didFinish: \(webView.url?.absoluteString.prefix(120) ?? "nil")")
             Task { @MainActor in self.tryFinishLogin() }
             checkSamlSubmitPage(on: webView)
+            checkKmsi(on: webView)
         }
     }
 
@@ -873,13 +877,23 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        recordNavError(error)
         log("导航失败: \(error.localizedDescription)")
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        recordNavError(error)
         if webView === loginWV {
             log("登录窗 加载失败: \(error.localizedDescription)")
         }
+    }
+
+    /// 记录导航错误（忽略 -999 cancelled：SAML POST 回流/重定向中常见，不算真错误）
+    func recordNavError(_ error: Error) {
+        let ns = error as NSError
+        guard ns.code != NSURLErrorCancelled else { return }
+        lastNavError = "\(ns.code) \(ns.localizedDescription)"
+        lastNavErrorAt = Date()
     }
 
     /// 导航策略：登录窗只允许 http(s)/about/data 留在窗内，其他协议一律拦下（防被系统交给外部应用/浏览器）
@@ -937,17 +951,6 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         return try await callJS(body, on: wv)
     }
 
-    /// 确保隐藏 WebView 停在 canvas host 上；force 时强制重载
-    func ensureOnCanvas(force: Bool = false) async throws {
-        ensureWebView()
-        guard let wv = webView else { throw SyncError.noWebView }
-        let onCanvas = isCanvasURL(wv.url)
-        if force || !onCanvas || wv.url == nil {
-            log("加载 \(Cfg.origin)（force=\(force)）")
-            wv.load(URLRequest(url: URL(string: Cfg.origin)!))
-        }
-    }
-
     // MARK: 会话检查 / 登录
 
     let selfCheckBody = """
@@ -978,21 +981,59 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         }
     }
 
-    /// 等导航跳转链稳定后检查会话
+    /// 会话检查：快路直接验；疑过期则重载并等 SSO 静默重登（ADFS 持久 cookie 尚在时自动回流，无需用户）
     func checkSession(force: Bool = false) async throws -> Bool {
-        try await ensureOnCanvas(force: force)
+        ensureWebView()
         guard let wv = webView else { throw SyncError.noWebView }
-        for _ in 0..<25 {
-            if !wv.isLoading { break }
-            try? await Task.sleep(nanoseconds: 400_000_000)
+
+        // 快路：已停在 canvas 域且页面稳定 → 直接验证（不重载，秒出结果）
+        if isCanvasURL(wv.url), !wv.isLoading {
+            if await fetchSelfOK(wv) { log("会话检查: OK（快路）"); return true }
+            log("会话检查：快路未通过，尝试静默重登…")
         }
-        guard isCanvasURL(wv.url) else {
-            log("会话检查：不在 canvas 域（\(wv.url?.absoluteString.prefix(120) ?? "nil")）")
-            return false
+
+        // 慢路：重载首页。session 过期会 302 去 SSO；ADFS cookie 尚在时自动回流，全程无需用户
+        lastNavError = nil
+        lastNavErrorAt = nil
+        log("会话检查：重载 \(Cfg.origin)（force=\(force)）")
+        wv.load(URLRequest(url: URL(string: Cfg.origin)!))
+        try? await Task.sleep(nanoseconds: 700_000_000)   // 等导航链启动（避开 isLoading 竞态）
+
+        let deadline = Date().addingTimeInterval(45)
+        var needUser = false
+        var canvasFail = 0
+        while Date() < deadline {
+            if wv.isLoading {
+                // 导航链进行中 → 等
+            } else if isCanvasURL(wv.url) {
+                if await fetchSelfOK(wv) { log("会话检查: OK（静默验证通过）"); return true }
+                canvasFail += 1
+                if (wv.url?.path.lowercased().contains("/login") ?? false) || canvasFail >= 6 {
+                    needUser = true
+                    break
+                }
+            } else if await isLoginPageNeedingUser(wv) {
+                needUser = true
+                break
+            } else if let e = lastNavError, let t = lastNavErrorAt, Date().timeIntervalSince(t) < 3 {
+                log("会话检查：导航错误（\(e)）")
+                break
+            }
+            try? await Task.sleep(nanoseconds: 800_000_000)
         }
-        let ok = await fetchSelfOK(wv)
-        log("会话检查: \(ok ? "OK" : "FAIL")")
-        return ok
+        log("会话检查: FAIL（needUser=\(needUser) url=\(wv.url?.absoluteString.prefix(120) ?? "nil")）")
+        return false
+    }
+
+    /// 探测当前页是否是「等人输入」的登录页（含密码框）→ 静默重登流程可提前放弃、改弹登录窗
+    func isLoginPageNeedingUser(_ wv: WKWebView) async -> Bool {
+        let probe = """
+        (function(){
+            try { return document.querySelector('input[type=password]') ? 'YES' : 'NO'; }
+            catch (e) { return 'NO'; }
+        })()
+        """
+        return ((try? await callJS(probe, on: wv)) == "YES")
     }
 
     func showLogin() {
@@ -1111,6 +1152,20 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         }
     }
 
+    /// 心跳保活（每 30 分钟）：轻量请求续期 Canvas 会话；失效时先试静默重登；彻底失败不弹窗
+    func keepAlive() async {
+        guard !state.isSyncing, loginWindow == nil else { return }
+        ensureWebView()
+        guard let wv = webView else { return }
+        if isCanvasURL(wv.url), !wv.isLoading, await fetchSelfOK(wv) {
+            log("心跳: OK")
+            return
+        }
+        log("心跳: 会话可能已过期，尝试静默重登…")
+        let ok = (try? await checkSession(force: true)) == true
+        log("心跳: 静默重登\(ok ? "成功" : "失败（保持现状，下次同步时再试）")")
+    }
+
     /// ADFS/SAML 递交页等待：若 3.5 秒未自动跳转，则协助递交一次（防卡在半路）
     func checkSamlSubmitPage(on wv: WKWebView) {
         let probe = """
@@ -1144,6 +1199,30 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
             """
             if let r2 = try? await self.callJS(submit, on: wv), r2 == "SUBMITTED" {
                 log("登录窗：SAML 递交页 3.5 秒未跳转，已协助提交")
+            }
+        }
+    }
+
+    /// 登录页若提供「保持登录 / Remember me」（KMSI）复选框 → 自动勾选，让 SSO 会话尽量持久
+    func checkKmsi(on wv: WKWebView) {
+        let js = """
+        (function(){
+            try {
+                const cbs = Array.from(document.querySelectorAll('input[type=checkbox]'));
+                const hit = cbs.find(c => /kmsi|keep.*(sign|log)|remember|stay.*sign|保持|记住/i.test(
+                    (c.name||'') + ' ' + (c.id||'') + ' ' + (c.getAttribute('aria-label')||'')));
+                if (!hit) return 'NONE';
+                if (hit.checked) return 'ALREADY';
+                hit.checked = true;
+                hit.dispatchEvent(new Event('change', {bubbles: true}));
+                return 'CHECKED';
+            } catch (e) { return 'ERR'; }
+        })()
+        """
+        Task { @MainActor in
+            guard self.loginWV === wv else { return }
+            if let r = try? await self.callJS(js, on: wv), r == "CHECKED" {
+                log("登录窗：检测到「保持登录」，已自动勾选")
             }
         }
     }
@@ -2192,7 +2271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Cfg.load()
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: syncRoot, withIntermediateDirectories: true)
-        log("CanvasBar v2.7 启动 | canvas=\(Cfg.origin) | 库=\(syncRoot.path) | macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        log("CanvasBar v2.8 启动 | canvas=\(Cfg.origin) | 库=\(syncRoot.path) | macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
         AppState.shared.reloadManifest()
         let mi = AppState.shared.manifest
         log("菜单文件索引: \(mi.count) 门课 / \(mi.values.reduce(0) { $0 + $1.count }) 个文件")
@@ -2218,6 +2297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 state.consumeAddDdlHook()
                 await state.refreshLibrary()
                 guard !state.isSyncing else { return }
+                await SyncEngine.shared.keepAlive()   // 30 分钟心跳：续期会话 / 静默重登（不弹窗）
                 let due = state.lastSync.map { Date().timeIntervalSince($0) > 20 * 3600 } ?? false
                 let forced = consumeSyncRequest()
                 guard due || forced else { return }

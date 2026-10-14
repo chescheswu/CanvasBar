@@ -6,7 +6,7 @@ set -e
 cd "$(dirname "$0")"
 
 APP=CanvasBar
-VERSION=2.7.0
+VERSION=2.8.0
 DEPLOY=13.0   # 最低支持 macOS 13
 DIST="$PWD/dist"
 NAME="$APP-$VERSION"
