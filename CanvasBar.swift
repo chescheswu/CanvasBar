@@ -3,11 +3,13 @@
 // 库内去重；跳过视频/大文件（保留在线链接）；DDL 可标记已提交/手动添加（选课程+日期）；每课新内容角标；按课程勾选同步；课程子菜单列出已同步文件（悬停展开、点击直开）+ 在 Canvas 打开课程；开机自启；应用图标（Canvas 花标，对话框/Finder 显示）
 // v2.7：子菜单按用户整理的文件夹结构展示（磁盘实时扫描）；子菜单可「关闭/恢复该课程同步」（关闭需确认，已下载文件保留）；单独同步某课程；登录窗健壮化（弹窗/重定向收敛到应用内、SAML 递交协助、登录态 Cookie 变化检测、登录窗手动关闭回退）
 // v2.8：登录态持久化——会话检查「快路 + SSO 静默重登」（Canvas session 过期时靠 ADFS 持久 cookie 自动回流，不再动辄弹登录窗）；30 分钟心跳保活（应用运行期间会话不再空闲过期）；登录页「保持登录」复选框自动勾选
+// v2.9：文件子菜单改「操作组」——打开（默认）/ 打开方式（系统可用 App 列表 + 其他…）/ 在 Finder 中显示（目录同）；新增「⬆️ 检查更新…」+ 一键更新（连 GitHub Releases：下载 zip → ditto 解压 → 版本 + 签名校验 → 后台脚本替换并重启）
 // 运行时配置：~/Library/Application Support/CanvasBar/config.json（Canvas 域名，便于分发他机使用）
 import AppKit
 import SwiftUI
 import WebKit
 import ServiceManagement
+import UniformTypeIdentifiers
 
 // MARK: - 常量
 
@@ -621,37 +623,74 @@ final class AppState: ObservableObject {
             clearNew(course.id)
             return
         }
-        let dir = course.url
-        let cid = String(course.id)
-        let fid = n.fid
         Task { @MainActor in
-            let found: String? = await Task.detached(priority: .userInitiated) {
-                Self.findByName(in: dir, name)
-            }.value
-            if let p = found {
-                if var cm = manifest[cid] {
-                    let key = fid ?? cm.first(where: { $0.value.name == name })?.key
-                    if let key, var e = cm[key] {
-                        e.path = p
-                        cm[key] = e
-                        manifest[cid] = cm
-                        Self.writeManifest(manifest)
-                    }
-                }
+            if let p = await healedPath(for: course, n) {
                 log("菜单打开（路径自愈）: \(name) → \(p)")
                 NSWorkspace.shared.open(URL(fileURLWithPath: p))
                 clearNew(course.id)
             } else {
-                log("菜单打开失败（未找到）: \(name) @ \(dir.path)")
+                log("菜单打开失败（未找到）: \(name) @ \(course.url.path)")
                 let a = NSAlert()
                 a.messageText = "找不到「\(name)」"
                 a.informativeText = "文件可能已被改名或删除。已为你打开课程文件夹。"
                 a.addButton(withTitle: "好")
                 NSApp.activate(ignoringOtherApps: true)
                 _ = a.runModal()
-                NSWorkspace.shared.open(dir)
+                NSWorkspace.shared.open(course.url)
             }
         }
+    }
+
+    /// 「在 Finder 中显示」：定位文件/目录（失效时同样按文件名自愈）；找不到则提示并打开课程文件夹
+    func revealNode(_ course: CachedCourse, _ n: MenuNode) {
+        let name = n.name.isEmpty ? ((n.path ?? "") as NSString).lastPathComponent : n.name
+        guard !name.isEmpty else { return }
+        if let p = n.path, FileManager.default.fileExists(atPath: p) {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)])
+            log("菜单在 Finder 显示: \(name)")
+            return
+        }
+        Task { @MainActor in
+            if let p = await healedPath(for: course, n) {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p)])
+                log("菜单在 Finder 显示（路径自愈）: \(name) → \(p)")
+            } else {
+                log("菜单定位失败（未找到）: \(name) @ \(course.url.path)")
+                let a = NSAlert()
+                a.messageText = "找不到「\(name)」"
+                a.informativeText = "文件可能已被改名或删除。已为你打开课程文件夹。"
+                a.addButton(withTitle: "好")
+                NSApp.activate(ignoringOtherApps: true)
+                _ = a.runModal()
+                NSWorkspace.shared.open(course.url)
+            }
+        }
+    }
+
+    /// 节点 → 有效路径：原路径失效时按文件名在课程目录内找回（文件会顺带修 manifest）
+    func healedPath(for course: CachedCourse, _ n: MenuNode) async -> String? {
+        let name = n.name.isEmpty ? ((n.path ?? "") as NSString).lastPathComponent : n.name
+        guard !name.isEmpty else { return nil }
+        if let p = n.path, FileManager.default.fileExists(atPath: p) { return p }
+        let dir = course.url
+        let found: String? = await Task.detached(priority: .userInitiated) {
+            Self.findByName(in: dir, name)
+        }.value
+        guard let p = found else { return nil }
+        if !n.isDir {
+            let cid = String(course.id)
+            let fid = n.fid
+            if var cm = manifest[cid] {
+                let key = fid ?? cm.first(where: { $0.value.name == name })?.key
+                if let key, var e = cm[key] {
+                    e.path = p
+                    cm[key] = e
+                    manifest[cid] = cm
+                    Self.writeManifest(manifest)
+                }
+            }
+        }
+        return p
     }
 
     nonisolated static func findByName(in root: URL, _ name: String) -> String? {
@@ -1934,6 +1973,342 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     }
 }
 
+// MARK: - 打开方式（可用 App 列表 / 用指定 App 打开）
+
+enum OpenWith {
+    struct AppOption: Identifiable, Hashable {
+        let url: URL
+        let name: String
+        let isDefault: Bool
+        var id: String { url.path }
+    }
+
+    private static var cache: [String: [AppOption]] = [:]
+
+    /// 能打开该文件的 App：默认 App 置顶（标记 isDefault），其余按名称排序
+    static func apps(for fileURL: URL) -> [AppOption] {
+        if let c = cache[fileURL.path] { return c }
+        let ws = NSWorkspace.shared
+        let fm = FileManager.default
+        var out: [AppOption] = []
+        if let d = ws.urlForApplication(toOpen: fileURL) {
+            out.append(AppOption(url: d, name: fm.displayName(atPath: d.path), isDefault: true))
+        }
+        var seen = Set(out.map { $0.url.path })
+        var rest: [AppOption] = []
+        for u in ws.urlsForApplications(toOpen: fileURL) where !seen.contains(u.path) {
+            seen.insert(u.path)
+            rest.append(AppOption(url: u, name: fm.displayName(atPath: u.path), isDefault: false))
+        }
+        rest.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        out.append(contentsOf: rest)
+        cache[fileURL.path] = out
+        return out
+    }
+
+    static func open(_ fileURL: URL, with appURL: URL) {
+        let appName = FileManager.default.displayName(atPath: appURL.path)
+        NSWorkspace.shared.open([fileURL], withApplicationAt: appURL,
+                                configuration: NSWorkspace.OpenConfiguration()) { _, err in
+            if let err {
+                log("打开方式失败（\(appName)）: \(err.localizedDescription)")
+            }
+        }
+        log("打开方式: \(fileURL.lastPathComponent) ← \(appName)")
+    }
+
+    /// 「其他…」：选任意 App 打开
+    @MainActor
+    static func chooseAppAndOpen(_ fileURL: URL) {
+        let p = NSOpenPanel()
+        p.message = "选择用于打开「\(fileURL.lastPathComponent)」的应用"
+        p.directoryURL = URL(fileURLWithPath: "/Applications")
+        p.canChooseFiles = true
+        p.canChooseDirectories = false
+        p.allowsMultipleSelection = false
+        p.allowedContentTypes = [.application]
+        NSApp.activate(ignoringOtherApps: true)
+        guard p.runModal() == .OK, let app = p.url else { return }
+        open(fileURL, with: app)
+    }
+}
+
+// MARK: - 检查更新 / 一键更新（GitHub Releases）
+
+enum Updater {
+    static let repo = "chescheswu/CanvasBar"
+
+    /// 当前版本：优先 Info.plist；环境变量 CANVASBAR_VERSION_OVERRIDE 可覆盖（更新链路实测用）
+    static var currentVersion: String {
+        if let v = ProcessInfo.processInfo.environment["CANVASBAR_VERSION_OVERRIDE"],
+           !v.trimmingCharacters(in: .whitespaces).isEmpty { return v }
+        return (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0.0.0"
+    }
+
+    struct Release: Decodable {
+        let tag_name: String
+        let name: String?
+        let html_url: String
+        let published_at: String?
+        let assets: [Asset]
+        struct Asset: Decodable {
+            let name: String
+            let browser_download_url: String
+        }
+    }
+
+    enum UpdateError: LocalizedError {
+        case message(String)
+        var errorDescription: String? {
+            if case let .message(m) = self { return m }
+            return nil
+        }
+    }
+
+    static func versionTuple(_ s: String) -> [Int] {
+        s.trimmingCharacters(in: CharacterSet(charactersIn: " vV"))
+            .split(separator: ".")
+            .map { Int(String($0.prefix(while: { $0.isNumber }))) ?? 0 }
+    }
+
+    static func isNewer(_ remote: String, than local: String) -> Bool {
+        let a = versionTuple(remote), b = versionTuple(local)
+        for i in 0..<max(a.count, b.count) {
+            let x = i < a.count ? a[i] : 0
+            let y = i < b.count ? b[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+
+    static func fetchLatest() async throws -> Release {
+        guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else {
+            throw UpdateError.message("无效的 API 地址")
+        }
+        var req = URLRequest(url: url)
+        req.setValue("CanvasBar-Updater", forHTTPHeaderField: "User-Agent")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.timeoutInterval = 20
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        guard code == 200 else {
+            throw UpdateError.message("GitHub 返回 HTTP \(code)（仓库 \(repo) 暂无 Release？）")
+        }
+        return try JSONDecoder().decode(Release.self, from: data)
+    }
+
+    /// 菜单「⬆️ 检查更新…」入口
+    @MainActor
+    static func checkFromMenu() {
+        let state = AppState.shared
+        state.progress = "正在检查更新…"
+        Task { @MainActor in
+            do {
+                let rel = try await fetchLatest()
+                state.progress = ""
+                if isNewer(rel.tag_name, than: currentVersion) {
+                    promptUpdate(rel)
+                } else {
+                    let a = NSAlert()
+                    a.messageText = "已是最新版本（v\(currentVersion)）"
+                    var info = "GitHub 最新 Release：\(rel.tag_name)"
+                    if let d = rel.published_at { info += "（\(d.prefix(10)) 发布）" }
+                    a.informativeText = info
+                    a.addButton(withTitle: "好")
+                    NSApp.activate(ignoringOtherApps: true)
+                    _ = a.runModal()
+                }
+            } catch {
+                state.progress = ""
+                log("检查更新失败: \(error.localizedDescription)")
+                let a = NSAlert()
+                a.messageText = "检查更新失败"
+                a.informativeText = "\(error.localizedDescription)\n可稍后重试，或直接打开 GitHub 发布页查看。"
+                a.addButton(withTitle: "好")
+                a.addButton(withTitle: "打开发布页")
+                NSApp.activate(ignoringOtherApps: true)
+                if a.runModal() == .alertSecondButtonReturn,
+                   let u = URL(string: "https://github.com/\(repo)/releases") {
+                    NSWorkspace.shared.open(u)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    static func promptUpdate(_ rel: Release) {
+        let a = NSAlert()
+        a.messageText = "发现新版本 \(rel.tag_name)（当前 v\(currentVersion)）"
+        var info = ""
+        if let d = rel.published_at { info += "发布于 \(d.prefix(10))\n" }
+        if let n = rel.name, !n.isEmpty { info += "\(n)\n" }
+        info += "\n「一键更新」将自动下载、校验、替换并重启，无需其它操作。\n更新后首次启动可能重新弹出「文稿文件夹」访问授权（应用签名变化所致，属正常现象）。"
+        a.informativeText = info
+        a.addButton(withTitle: "一键更新")
+        a.addButton(withTitle: "查看 Release 页面")
+        a.addButton(withTitle: "稍后")
+        NSApp.activate(ignoringOtherApps: true)
+        let r = a.runModal()
+        if r == .alertFirstButtonReturn {
+            performUpdate(rel)
+        } else if r == .alertSecondButtonReturn, let u = URL(string: rel.html_url) {
+            NSWorkspace.shared.open(u)
+        }
+    }
+
+    /// 一键更新：下载 → 解压校验 → 后台替换脚本 → 退出重启
+    @MainActor
+    static func performUpdate(_ rel: Release) {
+        let state = AppState.shared
+        let targetApp = Bundle.main.bundlePath
+        let parentDir = (targetApp as NSString).deletingLastPathComponent
+        guard FileManager.default.isWritableFile(atPath: parentDir) else {
+            fallbackToReleasePage(rel, why: "当前 App 所在目录不可写（\(parentDir)），无法自动更新。")
+            return
+        }
+        guard let asset = rel.assets.first(where: { $0.name.hasSuffix("universal.zip") })
+                ?? rel.assets.first(where: { $0.name.hasSuffix(".zip") }) else {
+            fallbackToReleasePage(rel, why: "该 Release 未附带 zip 安装包。")
+            return
+        }
+        state.progress = "正在下载 \(asset.name) …"
+        Task { @MainActor in
+            do {
+                let zip = try await download(asset)
+                state.progress = "下载完成，正在解压与校验…"
+                let staged = try stage(zip: zip, expectVersion: rel.tag_name)
+                state.progress = "更新包就绪，正在重启替换…"
+                try applyAndRelaunch(stagedApp: staged, targetApp: targetApp, zip: zip)
+            } catch {
+                state.progress = ""
+                log("更新失败: \(error.localizedDescription)")
+                let a = NSAlert()
+                a.messageText = "更新失败"
+                a.informativeText = "\(error.localizedDescription)\n已保留当前版本，可稍后重试。"
+                a.addButton(withTitle: "好")
+                NSApp.activate(ignoringOtherApps: true)
+                _ = a.runModal()
+            }
+        }
+    }
+
+    @MainActor
+    static func fallbackToReleasePage(_ rel: Release, why: String) {
+        let a = NSAlert()
+        a.messageText = "无法自动更新"
+        a.informativeText = "\(why)\n已为你打开 Release 页面，可手动下载安装。"
+        a.addButton(withTitle: "好")
+        NSApp.activate(ignoringOtherApps: true)
+        _ = a.runModal()
+        if let u = URL(string: rel.html_url) { NSWorkspace.shared.open(u) }
+    }
+
+    static func download(_ asset: Release.Asset) async throws -> URL {
+        guard let url = URL(string: asset.browser_download_url) else {
+            throw UpdateError.message("无效的下载地址")
+        }
+        var req = URLRequest(url: url)
+        req.setValue("CanvasBar-Updater", forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 120
+        let (tmp, resp) = try await URLSession.shared.download(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+        guard code == 200 else { throw UpdateError.message("下载失败（HTTP \(code)）") }
+        let dir = supportDir.appendingPathComponent("update", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dst = dir.appendingPathComponent(asset.name)
+        try? FileManager.default.removeItem(at: dst)   // App 自有暂存目录，清理旧包
+        try FileManager.default.moveItem(at: tmp, to: dst)
+        log("更新包已下载: \(dst.path)")
+        return dst
+    }
+
+    /// 解压 + 校验（版本号、签名、去隔离属性），返回包内 CanvasBar.app 路径
+    static func stage(zip: URL, expectVersion: String) throws -> URL {
+        let dir = supportDir.appendingPathComponent("update/stage", isDirectory: true)
+        try? FileManager.default.removeItem(at: dir)   // 清理上次暂存
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        guard run("/usr/bin/ditto", ["-x", "-k", zip.path, dir.path]) == 0 else {
+            throw UpdateError.message("解压失败（安装包可能不完整）")
+        }
+        guard let app = firstApp(in: dir) else {
+            throw UpdateError.message("安装包内未找到 CanvasBar.app")
+        }
+        let v = (NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))?["CFBundleShortVersionString"] as? String) ?? ""
+        let expect = expectVersion.trimmingCharacters(in: CharacterSet(charactersIn: " vV"))
+        guard !v.isEmpty, v == expect else {
+            throw UpdateError.message("版本校验失败（包内 v\(v) ≠ 期望 v\(expect)）")
+        }
+        guard run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path]) == 0 else {
+            throw UpdateError.message("签名校验未通过（安装包可能被篡改）")
+        }
+        _ = run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", app.path])
+        log("更新包校验通过: v\(v) @ \(app.path)")
+        return app
+    }
+
+    static func firstApp(in dir: URL) -> URL? {
+        guard let en = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil) else { return nil }
+        for case let u as URL in en where u.pathExtension == "app" {
+            return u
+        }
+        return nil
+    }
+
+    @discardableResult
+    static func run(_ bin: String, _ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: bin)
+        p.arguments = args
+        do { try p.run() } catch { return -1 }
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+
+    /// 写替换脚本（等待本进程退出 → 换包 → 重启；失败自动回滚），随后本进程退出
+    @MainActor
+    static func applyAndRelaunch(stagedApp: URL, targetApp: String, zip: URL) throws {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let udir = supportDir.appendingPathComponent("update", isDirectory: true)
+        let script = udir.appendingPathComponent("apply_update.sh")
+        let oldBackup = udir.appendingPathComponent("CanvasBar-old.app").path
+        let logPath = udir.appendingPathComponent("apply.log").path
+        let stageDir = stagedApp.deletingLastPathComponent().deletingLastPathComponent().path
+
+        let sh = """
+        #!/bin/zsh
+        exec >> "\(logPath)" 2>&1
+        echo "[update] $(date '+%F %T') 等待旧实例退出（pid \(pid)）…"
+        for i in {1..200}; do /bin/kill -0 \(pid) 2>/dev/null || break; sleep 0.3; done
+        sleep 0.5
+        if [ -d "\(oldBackup)" ]; then /usr/bin/trash "\(oldBackup)" >/dev/null 2>&1 || true; fi
+        if /bin/mv "\(targetApp)" "\(oldBackup)"; then
+            if /usr/bin/ditto "\(stagedApp.path)" "\(targetApp)"; then
+                /usr/bin/xattr -dr com.apple.quarantine "\(targetApp)" >/dev/null 2>&1 || true
+                echo "[update] 替换完成，重启：\(targetApp)"
+                /usr/bin/open "\(targetApp)"
+                /usr/bin/trash "\(oldBackup)" >/dev/null 2>&1 || true
+                /usr/bin/trash "\(stageDir)" >/dev/null 2>&1 || true
+                /usr/bin/trash "\(zip.path)" >/dev/null 2>&1 || true
+            else
+                echo "[update] ditto 失败，回滚旧版本"
+                /bin/mv "\(oldBackup)" "\(targetApp)"
+                /usr/bin/open "\(targetApp)"
+            fi
+        else
+            echo "[update] 无法移动旧 App（\(targetApp)）"
+        fi
+        """
+        try sh.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = [script.path]
+        try p.run()
+        log("更新：替换脚本已启动，应用即将退出以便替换")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { NSApp.terminate(nil) }
+    }
+}
+
 // MARK: - 菜单 UI
 
 struct MenuContent: View {
@@ -2049,6 +2424,7 @@ struct MenuContent: View {
         Button("📂 打开同步库（Canvas 同步）") { openFolder(syncRoot) }
         Button("⚙️ 设置 Canvas 域名…（\(Cfg.host)）") { ConfigUI.promptOrigin() }
         Button("📄 查看日志") { NSWorkspace.shared.open(logURL) }
+        Button("⬆️ 检查更新…") { Updater.checkFromMenu() }
 
         Toggle("🚀 开机自动启动", isOn: Binding(
             get: { state.autoStartOn },
@@ -2086,7 +2462,7 @@ struct MenuContent: View {
     }
 }
 
-/// 课程子菜单的文件树（递归：目录 → 子菜单，文件 → 点击直开；按用户整理的文件夹结构展示）
+/// 课程子菜单的文件树（递归：目录 → 子菜单，文件 → 操作组子菜单；按用户整理的文件夹结构展示）
 struct MenuTreeView: View {
     let nodes: [MenuNode]
     let course: CachedCourse
@@ -2097,13 +2473,54 @@ struct MenuTreeView: View {
             if n.isDir {
                 Menu("📁 " + n.name) {
                     MenuTreeView(nodes: n.children, course: course)
+                    Divider()
+                    Button("📍 在 Finder 中显示") { state.revealNode(course, n) }
                 }
             } else {
-                Button(state.isNewFile(course.id, n.name) ? "🆕 \(n.name)" : n.name) {
-                    state.openNode(course, n)
+                Menu(state.isNewFile(course.id, n.name) ? "🆕 \(n.name)" : n.name) {
+                    FileActionsMenu(course: course, node: n)
                 }
             }
         }
+    }
+}
+
+/// 文件级操作组：打开（默认应用）/ 打开方式（系统可用 App 列表）/ 在 Finder 中显示
+struct FileActionsMenu: View {
+    let course: CachedCourse
+    let node: MenuNode
+    @ObservedObject var state = AppState.shared
+
+    var body: some View {
+        Button("打开（默认应用）") { state.openNode(course, node) }
+        if let fileURL = existingFileURL {
+            let apps = OpenWith.apps(for: fileURL)
+            if !apps.isEmpty {
+                Menu("打开方式") {
+                    ForEach(Array(apps.prefix(12))) { a in
+                        Button {
+                            OpenWith.open(fileURL, with: a.url)
+                        } label: {
+                            Label {
+                                Text(a.isDefault ? "\(a.name)（默认）" : a.name)
+                            } icon: {
+                                Image(nsImage: NSWorkspace.shared.icon(forFile: a.url.path))
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("其他…（选择应用）") { OpenWith.chooseAppAndOpen(fileURL) }
+                }
+            }
+        }
+        Divider()
+        Button("📍 在 Finder 中显示") { state.revealNode(course, node) }
+    }
+
+    /// 文件当前有效路径（失效则不给「打开方式」列表，打开仍可走自愈找回）
+    private var existingFileURL: URL? {
+        guard let p = node.path, FileManager.default.fileExists(atPath: p) else { return nil }
+        return URL(fileURLWithPath: p)
     }
 }
 
@@ -2271,7 +2688,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Cfg.load()
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: syncRoot, withIntermediateDirectories: true)
-        log("CanvasBar v2.8 启动 | canvas=\(Cfg.origin) | 库=\(syncRoot.path) | macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        log("CanvasBar v\(Updater.currentVersion) 启动 | canvas=\(Cfg.origin) | 库=\(syncRoot.path) | macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
         AppState.shared.reloadManifest()
         let mi = AppState.shared.manifest
         log("菜单文件索引: \(mi.count) 门课 / \(mi.values.reduce(0) { $0 + $1.count }) 个文件")

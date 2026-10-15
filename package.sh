@@ -6,7 +6,7 @@ set -e
 cd "$(dirname "$0")"
 
 APP=CanvasBar
-VERSION=2.8.0
+VERSION=2.9.0
 DEPLOY=13.0   # 最低支持 macOS 13
 DIST="$PWD/dist"
 NAME="$APP-$VERSION"
@@ -83,6 +83,10 @@ CanvasBar v$VERSION — PolyU Canvas 菜单栏同步助手（macOS 通用版）
      同步目标固定为 ~/Documents/Canvas 同步/<课程>/，不写其他任何目录。
   4) 常用操作：点课程名展开子菜单（打开课程页 / 打开文件夹 / 立即同步此课程 /
      关闭该课程），已同步文件若被你重新整理成子文件夹，菜单会按你的文件夹结构实时展示。
+  5) 打开文件：悬停某个文件 →「打开（默认应用）」/「打开方式」（选择系统里其它
+     可用 App）/「在 Finder 中显示」；目录也有「在 Finder 中显示」。
+  6) 检查更新：菜单「⬆️ 检查更新…」对比 GitHub 最新 Release，发现新版本可一键更新
+     （自动下载、校验、替换并重启；更新后首次启动可能重新弹一次「文稿文件夹」授权）。
 
 【数据与卸载】
   配置与状态：~/Library/Application Support/CanvasBar/
