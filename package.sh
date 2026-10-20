@@ -10,8 +10,12 @@ VERSION=2.10.0
 DEPLOY=13.0   # 最低支持 macOS 13
 DIST="$PWD/dist"
 NAME="$APP-$VERSION"
-STAGE="$DIST/$NAME"
+# 暂存目录放 .build（隐藏目录，Spotlight 不索引），dist 只出 zip/dmg
+# —— 否则 dist 里的 .app 会被索引，启动台/聚焦里冒出多个 CanvasBar
+STAGE="$PWD/.build/stage-$NAME"
 ZIP="$DIST/$APP-$VERSION-universal.zip"
+
+mkdir -p "$DIST" "$PWD/.build"
 
 if [ -e "$STAGE" ]; then /usr/bin/trash "$STAGE" 2>/dev/null || true; fi
 if [ -e "$ZIP" ]; then /usr/bin/trash "$ZIP" 2>/dev/null || true; fi

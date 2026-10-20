@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 
 VERSION=${1:-2.10.0}
 APP=CanvasBar
-STAGE="$PWD/dist/$APP-$VERSION"
+STAGE="$PWD/.build/stage-$APP-$VERSION"
 DMG="$PWD/dist/$APP-$VERSION.dmg"
 VOL="$APP $VERSION"
 
@@ -45,3 +45,6 @@ PYEOF
 hdiutil verify "$DMG"
 shasum -a 256 "$DMG"
 echo "▸ DMG 完成：$DMG"
+
+# 暂存目录只在打包期间存在，出完 dmg 就撤（.app 留在磁盘上会被 Spotlight 索引）
+/usr/bin/trash "$STAGE" 2>/dev/null || true
