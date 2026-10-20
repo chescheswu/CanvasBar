@@ -10,6 +10,7 @@ import SwiftUI
 import WebKit
 import ServiceManagement
 import UniformTypeIdentifiers
+import Security
 
 // MARK: - 常量
 
@@ -832,6 +833,9 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     var hiddenWindow: NSWindow?
     var loginWV: WKWebView?
     var loginWindow: NSWindow?
+    var loginTimer: Timer?
+    var pendingLoginUser: String?
+    var pendingLoginPass: String?
     var lastLoginURLSeen: String?
     var loginCookieSig: String?
     var loginVerifyBusy = false
@@ -887,11 +891,23 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         let win = NSWindow(contentRect: NSRect(x: -4000, y: -4000, width: 1200, height: 800),
                            styleMask: [.borderless], backing: .buffered, defer: false)
         win.isReleasedWhenClosed = false
+        win.isOpaque = false
+        win.alphaValue = 0          // 不占合成像素
         let cv = NSView(frame: NSRect(x: 0, y: 0, width: 1200, height: 800))
         win.contentView = cv
         cv.addSubview(wv)
+        win.orderOut(nil)           // 明确不可见：WebKit 照跑 JS/网络，省掉图层合成
         hiddenWindow = win
         log("隐藏 WebView 已创建")
+    }
+
+    /// 释放页面、保留壳：Canvas SPA 的 DOM/JS 堆是内存大头，同步完顶成空白页让 WebKit 回收。
+    /// 下次同步 checkSession 慢路会重新 load，登录态在 cookie 里，不受影响。
+    func releasePage() {
+        guard let wv = webView, wv.url?.absoluteString != "about:blank" else { return }
+        wv.stopLoading()
+        wv.loadHTMLString("", baseURL: nil)
+        log("已释放 WebView 页面（保留壳）")
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -900,6 +916,8 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
             Task { @MainActor in self.tryFinishLogin() }
             checkSamlSubmitPage(on: webView)
             checkKmsi(on: webView)
+            enablePasswordAutoFill(on: webView)
+            autoFillLogin(on: webView)
         }
     }
 
@@ -967,10 +985,15 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         return nil
     }
 
-    /// 登录窗被手动关闭：清掉引用，让下次「登录」重新开窗
+    /// 登录窗被手动关闭：清掉引用 + 停轮询 + 解 delegate，让下次「登录」重新开窗
     func windowWillClose(_ notification: Notification) {
         guard let w = notification.object as? NSWindow, w === loginWindow else { return }
         if !loginFinished { log("登录窗口已关闭") }
+        loginTimer?.invalidate()
+        loginTimer = nil
+        loginWV?.stopLoading()
+        loginWV?.navigationDelegate = nil
+        loginWV?.uiDelegate = nil
         loginWindow = nil
         loginWV = nil
         loginFinished = false
@@ -1091,6 +1114,9 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .default()
         cfg.preferences.javaScriptCanOpenWindowsAutomatically = true   // SSO 流程可能用 window.open
+        cfg.userContentController.add(self, name: "login")
+        cfg.userContentController.addUserScript(
+            WKUserScript(source: Self.credentialCaptureJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         let wv = WKWebView(frame: content.bounds, configuration: cfg)
         wv.autoresizingMask = [.width, .height]
         wv.navigationDelegate = self
@@ -1109,9 +1135,15 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         snapshotLoginCookies()
         log("登录窗口已打开")
 
-        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] t in
+        loginTimer?.invalidate()
+        loginTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] t in
             Task { @MainActor in
-                guard let self, self.loginWindow != nil else { t.invalidate(); return }
+                guard let self else { t.invalidate(); return }
+                guard self.loginWindow != nil else {
+                    t.invalidate()
+                    self.loginTimer = nil
+                    return
+                }
                 self.tryFinishLogin()
             }
         }
@@ -1194,28 +1226,91 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     /// 心跳保活（每 30 分钟）：轻量请求续期 Canvas 会话；失效时先试静默重登；彻底失败不弹窗
     func keepAlive() async {
         guard !state.isSyncing, loginWindow == nil else { return }
+        // 页面在同步收尾已被 releasePage 释放 → 先查 cookie，不为一次心跳把整个 Canvas SPA 拉起来
+        if webView == nil || webView?.url?.absoluteString == "about:blank" {
+            if await sessionCookieValid() {
+                log("心跳: OK（cookie 有效，页面未加载）")
+                return
+            }
+            log("心跳: 无有效会话 cookie，尝试静默重登…")
+            let ok = (try? await checkSession(force: true)) == true
+            log("心跳: 静默重登\(ok ? "成功" : "失败（保持现状，下次同步时再试）")")
+            releasePage()
+            return
+        }
         ensureWebView()
         guard let wv = webView else { return }
         if isCanvasURL(wv.url), !wv.isLoading, await fetchSelfOK(wv) {
             log("心跳: OK")
+            persistSessionCookies()   // 服务端会滑动续期，顺手把新 cookie 再落一次盘
             return
         }
         log("心跳: 会话可能已过期，尝试静默重登…")
         let ok = (try? await checkSession(force: true)) == true
         log("心跳: 静默重登\(ok ? "成功" : "失败（保持现状，下次同步时再试）")")
+        releasePage()
+    }
+
+    /// Canvas 发的是会话 cookie（无 expiresDate），WebKit 只把它留在内存，app 一退就丢。
+    /// 这里复制一份并补 30 天有效期写回，重启后仍可自动续上。
+    /// 只延长本地保存时间，不延长服务端 session —— 靠 30 分钟心跳滑动续期。
+    func persistSessionCookies() {
+        let store = WKWebsiteDataStore.default().httpCookieStore
+        store.getAllCookies { cookies in
+            let host = Cfg.host.lowercased()
+            let expiry = Date().addingTimeInterval(30 * 24 * 3600)
+            let targets = cookies.filter { c in
+                guard c.expiresDate == nil else { return false }   // 本来就是持久 cookie
+                var d = c.domain.lowercased()
+                while d.hasPrefix(".") { d.removeFirst() }
+                return !d.isEmpty && (host.hasSuffix(d) || d.hasSuffix("polyu.edu.hk"))
+            }
+            guard !targets.isEmpty else { return }
+            log("cookie 持久化: 处理 \(targets.count) 条会话 cookie → 30 天")
+            for c in targets {
+                var props: [HTTPCookiePropertyKey: Any] = [
+                    .name: c.name, .value: c.value, .domain: c.domain,
+                    .path: c.path.isEmpty ? "/" : c.path, .expires: expiry,
+                ]
+                if c.isSecure { props[.secure] = "TRUE" }
+                guard let m = HTTPCookie(properties: props) else { continue }
+                store.setCookie(m) {}
+            }
+        }
+    }
+
+    /// 轻量会话判据：Canvas 域下存在未过期的 session cookie。
+    /// 纯本地读 cookie store，不发请求、不加载页面。
+    func sessionCookieValid() async -> Bool {
+        ensureWebView()   // 先建壳：WebKit 的 cookie store 要等 WebView/网络进程起来才读得到
+        let cookies: [HTTPCookie] = await withCheckedContinuation { cont in
+            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cont.resume(returning: $0) }
+        }
+        let host = Cfg.host.lowercased()
+        let now = Date()
+        let mine = cookies.filter { c in
+            var d = c.domain.lowercased()
+            while d.hasPrefix(".") { d.removeFirst() }
+            return !d.isEmpty && host.hasSuffix(d)
+        }
+        let ok = mine.contains { c in
+            (c.expiresDate.map { $0 > now } ?? true) && c.name.lowercased().contains("session")
+        }
+        if !ok {
+            log("cookie 校验: 无有效会话 cookie（本站点现有: \(mine.map(\.name).sorted().joined(separator: ","))）")
+        }
+        return ok
     }
 
     /// ADFS/SAML 递交页等待：若 3.5 秒未自动跳转，则协助递交一次（防卡在半路）
     func checkSamlSubmitPage(on wv: WKWebView) {
         let probe = """
-        (function(){
-            try {
-                const fs = Array.from(document.forms || []);
-                const f = fs.find(x => (x.querySelector && x.querySelector('input[name="SAMLResponse"]')) ||
-                                       /saml|canvas/i.test(x.getAttribute('action') || ''));
-                return f ? 'YES' : 'NO';
-            } catch (e) { return 'NO'; }
-        })()
+        try {
+            var fs = Array.from(document.forms || []);
+            var f = fs.find(function(x){ return (x.querySelector && x.querySelector('input[name="SAMLResponse"]')) ||
+                /saml|canvas/i.test(x.getAttribute('action') || ''); });
+            return f ? 'YES' : 'NO';
+        } catch (e) { return 'NO'; }
         """
         Task { @MainActor in
             guard self.loginWV === wv, self.loginWindow != nil else { return }
@@ -1226,15 +1321,13 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
             guard self.loginWV === wv, self.loginWindow != nil,
                   wv.url?.absoluteString == u0, !wv.isLoading else { return }
             let submit = """
-            (function(){
-                try {
-                    const fs = Array.from(document.forms || []);
-                    const f = fs.find(x => (x.querySelector && x.querySelector('input[name="SAMLResponse"]')) ||
-                                           /saml|canvas/i.test(x.getAttribute('action') || ''));
-                    if (f) { f.submit(); return 'SUBMITTED'; }
-                    return 'GONE';
-                } catch (e) { return 'ERR'; }
-            })()
+            try {
+                var fs = Array.from(document.forms || []);
+                var f = fs.find(function(x){ return (x.querySelector && x.querySelector('input[name="SAMLResponse"]')) ||
+                    /saml|canvas/i.test(x.getAttribute('action') || ''); });
+                if (f) { f.submit(); return 'SUBMITTED'; }
+                return 'GONE';
+            } catch (e) { return 'ERR:' + e; }
             """
             if let r2 = try? await self.callJS(submit, on: wv), r2 == "SUBMITTED" {
                 log("登录窗：SAML 递交页 3.5 秒未跳转，已协助提交")
@@ -1245,24 +1338,127 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     /// 登录页若提供「保持登录 / Remember me」（KMSI）复选框 → 自动勾选，让 SSO 会话尽量持久
     func checkKmsi(on wv: WKWebView) {
         let js = """
-        (function(){
-            try {
-                const cbs = Array.from(document.querySelectorAll('input[type=checkbox]'));
-                const hit = cbs.find(c => /kmsi|keep.*(sign|log)|remember|stay.*sign|保持|记住/i.test(
-                    (c.name||'') + ' ' + (c.id||'') + ' ' + (c.getAttribute('aria-label')||'')));
-                if (!hit) return 'NONE';
-                if (hit.checked) return 'ALREADY';
-                hit.checked = true;
-                hit.dispatchEvent(new Event('change', {bubbles: true}));
-                return 'CHECKED';
-            } catch (e) { return 'ERR'; }
-        })()
+        try {
+            var cbs = Array.from(document.querySelectorAll('input[type=checkbox]'));
+            var hit = cbs.find(function(c){ return /kmsi|keep.*(sign|log)|remember|stay.*sign|保持|记住/i.test(
+                (c.name||'') + ' ' + (c.id||'') + ' ' + (c.getAttribute('aria-label')||'')); });
+            if (!hit) return 'NONE';
+            if (hit.checked) return 'ALREADY';
+            hit.checked = true;
+            hit.dispatchEvent(new Event('change', {bubbles: true}));
+            return 'CHECKED';
+        } catch (e) { return 'ERR:' + e; }
         """
         Task { @MainActor in
             guard self.loginWV === wv else { return }
             if let r = try? await self.callJS(js, on: wv), r == "CHECKED" {
                 log("登录窗：检测到「保持登录」，已自动勾选")
             }
+        }
+    }
+
+    /// ADFS 登录页的账号/密码 input 没标 autocomplete，WebKit 因此不给系统密码自动填充。
+    /// 补上 username / current-password，顺手去掉部分主题用来挡填充的 readonly。
+    /// 注意：callAsyncJavaScript 的 body 必须自带 return —— 包成 IIFE 会返回 undefined。
+    func enablePasswordAutoFill(on wv: WKWebView) {
+        let js = """
+        try {
+            var u = document.querySelector('input[name="UserName"],input[name="username"],input[type="email"],input[autocomplete="username"]');
+            var p = document.querySelector('input[name="Password"],input[name="password"],input[type="password"]');
+            var out = [];
+            if (u) {
+                u.setAttribute('autocomplete', 'username');
+                u.removeAttribute('readonly');
+                out.push('user=' + (u.name || u.id || u.type));
+            }
+            if (p) {
+                p.setAttribute('autocomplete', 'current-password');
+                p.removeAttribute('readonly');
+                out.push('pass=' + (p.name || p.id || p.type));
+            }
+            return out.length ? out.join(' ') : 'NONE';
+        } catch (e) { return 'ERR:' + e; }
+        """
+        Task { @MainActor in
+            guard self.loginWV === wv else { return }
+            if let r = try? await self.callJS(js, on: wv) {
+                log("登录页 AutoFill: \(r)")
+            }
+        }
+    }
+
+    /// 登录窗注入脚本：拦到表单提交就把账号密码交回原生，登录成功后存钥匙串
+    static let credentialCaptureJS = """
+    document.addEventListener('submit', function(){
+        try {
+            var p = document.querySelector('input[type="password"]');
+            var u = document.querySelector('input[name="UserName"],input[name="username"],input[type="email"]');
+            if (p && p.value) {
+                window.webkit.messageHandlers.login.post({kind:'credentials', user: (u && u.value) || '', pass: p.value});
+            }
+        } catch (e) {}
+    }, true);
+    """
+
+    /// 登录页加载完：钥匙串里有凭据就直接填进表单，免手打。
+    /// ADFS 有时在 load 完再清一次表单，1.2 秒后补填一次。
+    func autoFillLogin(on wv: WKWebView) {
+        guard let v = LoginVault.load() else {
+            log("登录页自动填充: 钥匙串无凭据（菜单 →「设置 Canvas 登录账号…」）")
+            return
+        }
+        fillLoginForm(on: wv, user: v.user, password: v.password)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard self.loginWV === wv, !self.loginFinished else { return }
+            self.fillLoginForm(on: wv, user: v.user, password: v.password)
+        }
+    }
+
+    /// 把钥匙串凭据灌进 ADFS 表单。密码走 callAsyncJavaScript 的参数传入，不拼进脚本字符串；
+    /// 写入后派发 input/change，受控组件才不会把值刷回去。
+    func fillLoginForm(on wv: WKWebView?, user: String, password: String) {
+        guard let wv else { return }
+        let js = """
+        var q = function(s){ return document.querySelector(s); };
+        var u = q('input[name="UserName"],input[name="username"],input[type="email"]');
+        var p = q('input[name="Password"],input[name="password"],input[type="password"]');
+        var set = function(el, v){
+            var d = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            if (d && d.set) { d.set.call(el, v); } else { el.value = v; }
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+        };
+        if (u) set(u, user);
+        if (p) set(p, password);
+        return (u ? 'u' : '-') + (p ? 'p' : '-');
+        """
+        Task { @MainActor in
+            guard self.loginWV === wv else { return }
+            do {
+                let r = try await wv.callAsyncJavaScript(js, arguments: ["user": user, "password": password],
+                                                         in: nil, contentWorld: .page)
+                log("登录页填充: \(String(describing: r))")
+            } catch {
+                log("登录页填充失败: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func handleLoginMessage(kind: String, body: [String: Any]) {
+        switch kind {
+        case "fill":
+            guard let v = LoginVault.load() else { log("登录页填充: 钥匙串无记录"); return }
+            fillLoginForm(on: loginWV, user: v.user, password: v.password)
+        case "credentials":
+            let u = body["user"] as? String ?? ""
+            let p = body["pass"] as? String ?? ""
+            guard !p.isEmpty else { return }
+            pendingLoginUser = u
+            pendingLoginPass = p
+            log("登录页填充: 已捕获提交的凭据（\(u.isEmpty ? "用户名空" : u)）")
+        default:
+            break
         }
     }
 
@@ -1274,6 +1470,13 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         loginWindow?.close()
         loginWindow = nil
         loginWV = nil
+        persistSessionCookies()          // 登录态落盘，重启后不用重登
+        if let u = pendingLoginUser, let p = pendingLoginPass, !u.isEmpty, !p.isEmpty {
+            LoginVault.save(user: u, password: p)
+            log("登录页填充: 凭据已存入钥匙串（\(u)）")
+        }
+        pendingLoginUser = nil
+        pendingLoginPass = nil
         state.progress = "✅ 登录成功，开始同步…"
         Task { @MainActor in await self.syncAll() }
     }
@@ -1286,6 +1489,7 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         defer {
             state.isSyncing = false
             state.saveState()
+            releasePage()          // 同步收尾即卸载页面，避免 Canvas SPA 常驻
         }
         log("=== 同步开始 ===\(only == nil ? "" : " 仅课程 \(only!.map(String.init).joined(separator: ","))") 库=\(syncRoot.path)")
         do {
@@ -1505,6 +1709,7 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
             state.reloadLinks()
             await state.refreshLibrary(force: true)
             state.lastSync = Date()
+            persistSessionCookies()   // 同步时服务端刷新过会话，落盘保活
             var parts = ["新增 \(added)", "已在库 \(kept + nManifest)"]
             if nSkipVideo + nSkipBig > 0 { parts.append("跳过 \(nSkipVideo + nSkipBig)") }
             if nSkipCourse > 0 { parts.append("未勾选 \(nSkipCourse) 门") }
@@ -1877,28 +2082,40 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
             pending[fileId] = cont
             let script = """
             void (async () => {
+                const fid = \(fileId);
                 try {
-                    const pr = await fetch('/api/v1/files/\(fileId)/public_url', {credentials: 'include'});
+                    const pr = await fetch('/api/v1/files/' + fid + '/public_url', {credentials: 'include'});
                     if (!pr.ok) throw new Error('public_url HTTP ' + pr.status);
                     const pj = await pr.json();
                     const link = pj.public_url || pj.url;
                     if (!link) throw new Error('no public_url in response');
                     const r = await fetch(link, {credentials: 'include'});
                     if (!r.ok) throw new Error('download HTTP ' + r.status);
-                    const buf = await r.arrayBuffer();
-                    const bytes = new Uint8Array(buf);
-                    let bin = '';
-                    const CH = 0x8000;
-                    for (let i = 0; i < bytes.length; i += CH)
-                        bin += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + CH, bytes.length)));
-                    const b64 = btoa(bin);
-                    const CH2 = 1 << 20;
-                    const n = Math.max(1, Math.ceil(b64.length / CH2));
-                    for (let i = 0; i < n; i++)
-                        window.webkit.messageHandlers.sync.post({kind: 'chunk', fid: \(fileId), i: i, data: b64.slice(i * CH2, (i + 1) * CH2)});
-                    window.webkit.messageHandlers.sync.post({kind: 'done', fid: \(fileId)});
+                    if (!r.body || !r.body.getReader) throw new Error('stream unsupported');
+                    // 边下边发：只留 48KB 缓冲，不再整文件 arrayBuffer→字符串→base64 三份拷贝
+                    const CHUNK = 48 * 1024;              // 3 的倍数 → base64 无 padding，分片可无缝拼接
+                    const reader = r.body.getReader();
+                    let buf = new Uint8Array(0), seq = 0;
+                    const flush = (u8) => {
+                        let bin = '';
+                        for (let i = 0; i < u8.length; i += 0x8000)
+                            bin += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + 0x8000, u8.length)));
+                        window.webkit.messageHandlers.sync.post({kind: 'chunk', fid: fid, i: seq++, data: btoa(bin)});
+                    };
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        if (done) break;
+                        if (!value || !value.length) continue;
+                        const merged = new Uint8Array(buf.length + value.length);
+                        merged.set(buf, 0); merged.set(value, buf.length);
+                        buf = merged;
+                        while (buf.length >= CHUNK) { flush(buf.subarray(0, CHUNK)); buf = buf.slice(CHUNK); }
+                    }
+                    if (buf.length) flush(buf);
+                    if (seq === 0) flush(new Uint8Array(0));   // 空文件也发一片，保持编号存在
+                    window.webkit.messageHandlers.sync.post({kind: 'done', fid: fid});
                 } catch (e) {
-                    window.webkit.messageHandlers.sync.post({kind: 'fail', fid: \(fileId), error: String(e)});
+                    window.webkit.messageHandlers.sync.post({kind: 'fail', fid: fid, error: String(e)});
                 }
             })();
             """
@@ -1921,6 +2138,10 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
                                didReceive message: WKScriptMessage) {
         guard let body = message.body as? [String: Any],
               let kind = body["kind"] as? String else { return }
+        if message.name == "login" {
+            handleLoginMessage(kind: kind, body: body)
+            return
+        }
         if kind == "chunk", let fid = (body["fid"] as? NSNumber)?.int64Value,
            let data = body["data"] as? String, let i = (body["i"] as? NSNumber)?.intValue {
             chunks[fid, default: [:]][i] = data
@@ -2081,6 +2302,25 @@ enum Updater {
         return false
     }
 
+    /// 专用会话：请求间隔超时 15s / 资源总超时 60s（防连接挂起时永久等待）
+    static let session: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = 15
+        c.timeoutIntervalForResource = 60
+        return URLSession(configuration: c)
+    }()
+
+    /// 弹窗并强制置顶（LSUIElement / 前台无焦点场景下的可见性保障）
+    @MainActor
+    static func showAlert(_ a: NSAlert) -> NSApplication.ModalResponse {
+        a.window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        a.window.level = .modalPanel
+        NSApp.activate(ignoringOtherApps: true)
+        a.window.orderFrontRegardless()
+        a.window.makeKeyAndOrderFront(nil)
+        return a.runModal()
+    }
+
     static func fetchLatest() async throws -> Release {
         guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else {
             throw UpdateError.message("无效的 API 地址")
@@ -2088,8 +2328,7 @@ enum Updater {
         var req = URLRequest(url: url)
         req.setValue("CanvasBar-Updater", forHTTPHeaderField: "User-Agent")
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        req.timeoutInterval = 20
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await session.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
         guard code == 200 else {
             throw UpdateError.message("GitHub 返回 HTTP \(code)（仓库 \(repo) 暂无 Release？）")
@@ -2102,21 +2341,24 @@ enum Updater {
     static func checkFromMenu() {
         let state = AppState.shared
         state.progress = "正在检查更新…"
+        log("检查更新：用户触发（当前 v\(currentVersion)）")
         Task { @MainActor in
             do {
                 let rel = try await fetchLatest()
                 state.progress = ""
                 if isNewer(rel.tag_name, than: currentVersion) {
+                    log("检查更新：远端 \(rel.tag_name) → 有新版本，弹窗提示")
                     promptUpdate(rel)
                 } else {
+                    log("检查更新：远端 \(rel.tag_name) → 已是最新")
                     let a = NSAlert()
                     a.messageText = "已是最新版本（v\(currentVersion)）"
                     var info = "GitHub 最新 Release：\(rel.tag_name)"
                     if let d = rel.published_at { info += "（\(d.prefix(10)) 发布）" }
                     a.informativeText = info
                     a.addButton(withTitle: "好")
-                    NSApp.activate(ignoringOtherApps: true)
-                    _ = a.runModal()
+                    _ = showAlert(a)
+                    log("检查更新：已是最新提示已关闭")
                 }
             } catch {
                 state.progress = ""
@@ -2126,8 +2368,7 @@ enum Updater {
                 a.informativeText = "\(error.localizedDescription)\n可稍后重试，或直接打开 GitHub 发布页查看。"
                 a.addButton(withTitle: "好")
                 a.addButton(withTitle: "打开发布页")
-                NSApp.activate(ignoringOtherApps: true)
-                if a.runModal() == .alertSecondButtonReturn,
+                if showAlert(a) == .alertSecondButtonReturn,
                    let u = URL(string: "https://github.com/\(repo)/releases") {
                     NSWorkspace.shared.open(u)
                 }
@@ -2147,12 +2388,15 @@ enum Updater {
         a.addButton(withTitle: "一键更新")
         a.addButton(withTitle: "查看 Release 页面")
         a.addButton(withTitle: "稍后")
-        NSApp.activate(ignoringOtherApps: true)
-        let r = a.runModal()
+        let r = showAlert(a)
         if r == .alertFirstButtonReturn {
+            log("更新提示：用户选择「一键更新」")
             performUpdate(rel)
-        } else if r == .alertSecondButtonReturn, let u = URL(string: rel.html_url) {
-            NSWorkspace.shared.open(u)
+        } else if r == .alertSecondButtonReturn {
+            log("更新提示：用户选择「查看 Release 页面」")
+            if let u = URL(string: rel.html_url) { NSWorkspace.shared.open(u) }
+        } else {
+            log("更新提示：用户选择「稍后」")
         }
     }
 
@@ -2162,15 +2406,19 @@ enum Updater {
         let state = AppState.shared
         let targetApp = Bundle.main.bundlePath
         let parentDir = (targetApp as NSString).deletingLastPathComponent
+        log("一键更新：开始（target=\(targetApp)）")
         guard FileManager.default.isWritableFile(atPath: parentDir) else {
+            log("一键更新：中止——目录不可写 \(parentDir)")
             fallbackToReleasePage(rel, why: "当前 App 所在目录不可写（\(parentDir)），无法自动更新。")
             return
         }
         guard let asset = rel.assets.first(where: { $0.name.hasSuffix("universal.zip") })
                 ?? rel.assets.first(where: { $0.name.hasSuffix(".zip") }) else {
+            log("一键更新：中止——Release 未附带 zip 资产")
             fallbackToReleasePage(rel, why: "该 Release 未附带 zip 安装包。")
             return
         }
+        log("一键更新：选中资产 \(asset.name)")
         state.progress = "正在下载 \(asset.name) …"
         Task { @MainActor in
             do {
@@ -2198,8 +2446,7 @@ enum Updater {
         a.messageText = "无法自动更新"
         a.informativeText = "\(why)\n已为你打开 Release 页面，可手动下载安装。"
         a.addButton(withTitle: "好")
-        NSApp.activate(ignoringOtherApps: true)
-        _ = a.runModal()
+        _ = showAlert(a)
         if let u = URL(string: rel.html_url) { NSWorkspace.shared.open(u) }
     }
 
@@ -2207,10 +2454,10 @@ enum Updater {
         guard let url = URL(string: asset.browser_download_url) else {
             throw UpdateError.message("无效的下载地址")
         }
+        log("更新：开始下载 \(asset.name)")
         var req = URLRequest(url: url)
         req.setValue("CanvasBar-Updater", forHTTPHeaderField: "User-Agent")
-        req.timeoutInterval = 120
-        let (tmp, resp) = try await URLSession.shared.download(for: req)
+        let (tmp, resp) = try await session.download(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
         guard code == 200 else { throw UpdateError.message("下载失败（HTTP \(code)）") }
         let dir = supportDir.appendingPathComponent("update", isDirectory: true)
@@ -2421,10 +2668,12 @@ struct MenuContent: View {
         Divider()
 
         Button("🔑 登录 Canvas…") { SyncEngine.shared.showLogin() }
+        Button("🔑 设置 Canvas 登录账号…") { LoginVaultUI.promptSave() }
         Button("📂 打开同步库（Canvas 同步）") { openFolder(syncRoot) }
         Button("⚙️ 设置 Canvas 域名…（\(Cfg.host)）") { ConfigUI.promptOrigin() }
         Button("📄 查看日志") { NSWorkspace.shared.open(logURL) }
-        Button("⬆️ 检查更新…") { Updater.checkFromMenu() }
+        let updBusy = ["正在检查更新", "正在下载", "下载完成", "更新包就绪"].contains { state.progress.hasPrefix($0) }
+        Button(updBusy ? "⏳ 更新进行中…" : "⬆️ 检查更新…") { Updater.checkFromMenu() }
 
         Toggle("🚀 开机自动启动", isOn: Binding(
             get: { state.autoStartOn },
@@ -2679,6 +2928,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // 缓存封顶：默认 URLCache 内存上限偏高，大文件下载会一路把内存顶上去
+        URLCache.shared = URLCache(memoryCapacity: 16 << 20, diskCapacity: 200 << 20)
         trimLogIfNeeded()
         // v2.6：应用图标（取 bundle 内 AppIcon.icns；对话框等系统界面使用）
         if let u = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
@@ -2697,14 +2948,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppState.shared.consumeAddDdlHook()
             await AppState.shared.refreshLibrary(force: true)
             let engine = SyncEngine.shared
-            let loggedIn = (try? await engine.checkSession(force: false)) == true
+            // 先看 cookie：有效就不加载整页，避免冷启动即把 Canvas SPA 拉进内存
+            var loggedIn = await engine.sessionCookieValid()
+            if !loggedIn { loggedIn = (try? await engine.checkSession(force: false)) == true }
             if loggedIn {
                 let due = AppState.shared.lastSync.map { Date().timeIntervalSince($0) > 20 * 3600 } ?? true
                 let forced = consumeSyncRequest()
-                if due || forced { await engine.syncAll() }
-            } else if AppState.shared.lastSync == nil {
-                engine.state.progress = "首次使用：请登录 Canvas"
-                engine.showLogin()
+                if due || forced {
+                    await engine.syncAll()          // 同步收尾自己会 releasePage
+                } else {
+                    engine.releasePage()            // 只验会话不同步 → 立刻卸页面，别留一屏 SPA 常驻
+                }
+            } else {
+                engine.releasePage()                // 验不过就把 ADFS 页卸掉
+                if AppState.shared.lastSync == nil {
+                    engine.state.progress = "首次使用：请登录 Canvas"
+                    engine.showLogin()
+                }
             }
         }
 
@@ -2718,10 +2978,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let due = state.lastSync.map { Date().timeIntervalSince($0) > 20 * 3600 } ?? false
                 let forced = consumeSyncRequest()
                 guard due || forced else { return }
-                if (try? await SyncEngine.shared.checkSession(force: false)) == true {
-                    await SyncEngine.shared.syncAll()
-                }
+                await SyncEngine.shared.syncAll()   // syncAll 内部验会话并处理未登录，省一次整页加载
             }
+        }
+    }
+}
+
+// MARK: - 登录凭据（Keychain）
+
+/// macOS 的 WKWebView 拿不到系统密码自动填充：Safari 那套是浏览器自带的，
+/// 第三方 app 要接得靠 associated domains + 域名方放 apple-app-site-association，
+/// polyu.edu.hk 不在我们控制范围内。所以走自建：凭据存钥匙串，登录页注入一个填充按钮。
+struct VaultCredential {
+    let user: String
+    let password: String
+}
+
+enum LoginVault {
+    private static let service = "local.chester.canvasbar.canvas"
+
+    static func save(user: String, password: String) {
+        guard let data = password.data(using: .utf8) else { return }
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+        ]
+        SecItemDelete(base as CFDictionary)
+        var add = base
+        add[kSecAttrAccount as String] = user
+        add[kSecValueData as String] = data
+        add[kSecAttrLabel as String] = "CanvasBar · Canvas 登录"
+        SecItemAdd(add as CFDictionary, nil)
+    }
+
+    static func load() -> VaultCredential? {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnAttributes as String: true,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+              let d = out as? [String: Any],
+              let raw = d[kSecValueData as String] as? Data,
+              let pass = String(data: raw, encoding: .utf8) else { return nil }
+        return VaultCredential(user: (d[kSecAttrAccount as String] as? String) ?? "", password: pass)
+    }
+
+    static func clear() {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+        ]
+        SecItemDelete(q as CFDictionary)
+    }
+}
+
+// MARK: - 账号设置面板
+
+enum LoginVaultUI {
+    @MainActor
+    static func promptSave() {
+        let a = NSAlert()
+        a.messageText = "设置 Canvas 登录账号"
+        a.informativeText = "存进 macOS 钥匙串（仅本机）。之后打开登录窗会自动填入账号密码。"
+        a.addButton(withTitle: "保存")
+        a.addButton(withTitle: "删除已保存")
+        a.addButton(withTitle: "取消")
+
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 58))
+        let user = NSTextField(frame: NSRect(x: 0, y: 32, width: 340, height: 24))
+        user.placeholderString = "账号（例：25123456d@connect.polyu.hk）"
+        let pass = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        pass.placeholderString = "密码"
+        if let v = LoginVault.load() { user.stringValue = v.user }
+        box.addSubview(user)
+        box.addSubview(pass)
+        a.accessoryView = box
+        a.window.initialFirstResponder = user
+        NSApp.activate(ignoringOtherApps: true)
+
+        switch a.runModal() {
+        case .alertFirstButtonReturn:
+            let u = user.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !u.isEmpty, !pass.stringValue.isEmpty else {
+                log("设置登录账号: 账号或密码为空，未保存")
+                return
+            }
+            LoginVault.save(user: u, password: pass.stringValue)
+            log("设置登录账号: 已存入钥匙串（\(u)）")
+        case .alertSecondButtonReturn:
+            LoginVault.clear()
+            log("设置登录账号: 已从钥匙串删除")
+        default:
+            break
         }
     }
 }

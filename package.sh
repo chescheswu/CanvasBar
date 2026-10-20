@@ -6,18 +6,19 @@ set -e
 cd "$(dirname "$0")"
 
 APP=CanvasBar
-VERSION=2.9.0
+VERSION=2.10.0
 DEPLOY=13.0   # 最低支持 macOS 13
 DIST="$PWD/dist"
 NAME="$APP-$VERSION"
 STAGE="$DIST/$NAME"
 ZIP="$DIST/$APP-$VERSION-universal.zip"
 
-rm -rf "$STAGE" "$ZIP"
+if [ -e "$STAGE" ]; then /usr/bin/trash "$STAGE" 2>/dev/null || true; fi
+if [ -e "$ZIP" ]; then /usr/bin/trash "$ZIP" 2>/dev/null || true; fi
 mkdir -p "$STAGE/source" "$STAGE/$APP.app/Contents/MacOS" "$STAGE/$APP.app/Contents/Resources"
 
 BUILD_TMP=$(mktemp -d)
-trap 'rm -rf "$BUILD_TMP"' EXIT
+trap '/usr/bin/trash "$BUILD_TMP" 2>/dev/null || true' EXIT
 
 echo "▸ 编译 arm64 …"
 swiftc -O -swift-version 5 -parse-as-library -target arm64-apple-macosx$DEPLOY CanvasBar.swift -o "$BUILD_TMP/$APP.arm64"
@@ -79,6 +80,8 @@ CanvasBar v$VERSION — PolyU Canvas 菜单栏同步助手（macOS 通用版）
   1) 启动后菜单栏会出现 CanvasBar 图标；没有 Dock 图标和主窗口，是正常设计（纯菜单栏程序）。
   2) 点菜单栏图标 →「🔑 登录 Canvas…」，在弹出的窗口里完成 PolyU 统一身份认证；
      成功后窗口自动关闭并开始首次同步（本版登录窗已做健壮化处理）。
+     想免手打：菜单「🔑 设置 Canvas 登录账号…」存一次账号密码（存 macOS 钥匙串，
+     只在本机），之后打开登录窗会自动填入账号密码。
   3) 首次同步会弹出「访问你的"文档"文件夹」授权请求，请允许。
      同步目标固定为 ~/Documents/Canvas 同步/<课程>/，不写其他任何目录。
   4) 常用操作：点课程名展开子菜单（打开课程页 / 打开文件夹 / 立即同步此课程 /

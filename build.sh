@@ -7,7 +7,7 @@ APP=CanvasBar
 BUILD="$PWD/.build"
 APPDIR="$BUILD/$APP.app"
 
-rm -rf "$APPDIR"
+[ -e "$APPDIR" ] && /usr/bin/trash "$APPDIR" 2>/dev/null
 mkdir -p "$APPDIR/Contents/MacOS" "$APPDIR/Contents/Resources"
 
 swiftc -O -swift-version 5 -parse-as-library CanvasBar.swift -o "$APPDIR/Contents/MacOS/$APP"
@@ -27,7 +27,7 @@ cat > "$APPDIR/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleName</key><string>CanvasBar</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.9.0</string>
+    <key>CFBundleShortVersionString</key><string>2.10.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHumanReadableCopyright</key><string>Chester</string>
 </dict>

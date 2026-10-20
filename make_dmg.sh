@@ -5,7 +5,7 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION=${1:-2.9.0}
+VERSION=${1:-2.10.0}
 APP=CanvasBar
 STAGE="$PWD/dist/$APP-$VERSION"
 DMG="$PWD/dist/$APP-$VERSION.dmg"
@@ -24,7 +24,7 @@ else
 fi
 
 SETTINGS=$(mktemp -t canvasbar-dmg.XXXXXX)
-trap 'rm -f "$SETTINGS"' EXIT
+trap '/usr/bin/trash "$SETTINGS" 2>/dev/null || true' EXIT
 
 cat > "$SETTINGS" <<PYEOF
 volume_name = "$VOL"
