@@ -2584,13 +2584,11 @@ enum Updater {
 
 // MARK: - 菜单尺寸（v2.11）
 
-/// 各级子菜单统一宽度：约根菜单（≈460pt）的 2/3。
+/// 各级菜单统一宽度：文本可用 223pt，加菜单内边距后根菜单实测正好 300pt。
 /// 菜单项标题超出可用宽度时按中段省略，避免长文件名把整级菜单一路撑宽。
 enum MenuMetrics {
-    /// 子菜单目标宽度
-    static let submenuWidth: CGFloat = 300
-    /// 菜单项文本可用宽度（扣掉菜单左右内边距与图标位）
-    static let textWidth: CGFloat = 250
+    /// 菜单项文本可用宽度（300pt 扣掉菜单左右内边距与图标位；实测 250 → 327pt）
+    static let textWidth: CGFloat = 223
 
     static let font = NSFont.menuFont(ofSize: 0)
 
@@ -2621,7 +2619,7 @@ enum MenuMetrics {
 
     /// 下级菜单顶部：一级菜单放不下的完整标题在这里折行（按词断，CJK 无空格时按字断）
     static func wrap(_ s: String) -> [String] {
-        let t = s.replacingOccurrences(of: "🆕 ", with: "🆕")
+        let t = s.replacingOccurrences(of: "🆕 ", with: "🆕\u{00A0}")
         guard width(t) > textWidth else { return [t] }
         var lines: [String] = []
         var line = ""
@@ -2665,96 +2663,6 @@ enum MenuMetrics {
     }
 
     static func folderLabel(_ name: String) -> String { "📁 " + name }
-}
-
-/// 文件行点击目标：点击 = 默认应用打开，悬停 = 右侧展开「更多打开方式」。
-/// AppKit 对带 submenu 的菜单项默认只在点击时展开子菜单，改写 action 后点击即执行主操作。
-@MainActor
-final class FileRowTarget: NSObject {
-    static let shared = FileRowTarget()
-
-    @objc func openDefault(_ sender: NSMenuItem) {
-        guard let r = sender.representedObject as? FileRef,
-              let node = FileRowHook.resolve(courseId: r.courseId, labels: r.labels),
-              let course = AppState.shared.courses.first(where: { $0.id == r.courseId }) else { return }
-        AppState.shared.openNode(course, node)
-    }
-}
-
-struct FileRef {
-    let courseId: Int64
-    /// 从课程下到该文件的菜单标签链（已按显示宽度省略）
-    let labels: [String]
-}
-
-/// 菜单打开时：统一各级菜单宽度，并给文件行补默认打开动作（SwiftUI 不会给带子菜单的项设 action）
-@MainActor
-final class FileRowHook: NSObject {
-    static let shared = FileRowHook()
-
-    static func install() {
-        NotificationCenter.default.addObserver(
-            shared,
-            selector: #selector(menuDidBeginTracking(_:)),
-            name: NSMenu.didBeginTrackingNotification,
-            object: nil
-        )
-    }
-
-    @objc private func menuDidBeginTracking(_ note: Notification) {
-        guard let menu = note.object as? NSMenu else { return }
-        // 各级菜单统一 300pt（含根菜单）
-        if menu.minimumWidth < MenuMetrics.submenuWidth {
-            menu.minimumWidth = MenuMetrics.submenuWidth
-        }
-        // 文件操作组必有「其他…（选择应用）」；目录组没有
-        guard menu.items.contains(where: { $0.title.hasPrefix("其他…") }) else { return }
-        guard let host = menu.supermenu?.items.first(where: { $0.submenu === menu }) else { return }
-        if let a = host.action, a != #selector(NSMenu.submenuAction(_:)) { return }
-        guard let ref = ref(for: host) else { return }
-        host.target = FileRowTarget.shared
-        host.action = #selector(FileRowTarget.openDefault(_:))
-        host.representedObject = ref
-    }
-
-    /// 从文件行向上走到课程行，收集标签链
-    private func ref(for item: NSMenuItem) -> FileRef? {
-        var labels = [item.title]
-        var row = item
-        while let parentMenu = row.menu {
-            guard let owner = parentMenu.supermenu?.items.first(where: { $0.submenu === parentMenu }) else { return nil }
-            let t = owner.title
-            if t.hasPrefix("📚") {
-                // 课程行标题已按宽度省略，改按「根菜单里 📚 行的顺序」对应 courses（顺序即 ForEach 顺序）
-                guard let root = parentMenu.supermenu else { return nil }
-                let rows = root.items.filter { $0.title.hasPrefix("📚") }
-                guard let idx = rows.firstIndex(where: { $0 === owner }),
-                      idx < AppState.shared.courses.count else { return nil }
-                return FileRef(courseId: AppState.shared.courses[idx].id, labels: labels)
-            }
-            guard t.hasPrefix("📁") else { return nil }
-            labels.insert(t, at: 0)
-            row = owner
-        }
-        return nil
-    }
-
-    /// 标签链 → MenuNode：用与菜单构建相同的省略规则重算，逐级比对
-    static func resolve(courseId: Int64, labels: [String]) -> MenuNode? {
-        guard let c = AppState.shared.courses.first(where: { $0.id == courseId }) else { return nil }
-        func walk(_ nodes: [MenuNode], _ prefix: [String]) -> MenuNode? {
-            for n in nodes {
-                if n.isDir {
-                    let p = prefix + [MenuMetrics.fit(MenuMetrics.folderLabel(n.name))]
-                    if let hit = walk(n.children, p) { return hit }
-                } else if prefix + [MenuMetrics.fit(MenuMetrics.fileLabel(courseId, n.name))] == labels {
-                    return n
-                }
-            }
-            return nil
-        }
-        return walk(AppState.shared.menuNodes(for: c), [])
-    }
 }
 
 // MARK: - 菜单 UI
@@ -2969,12 +2877,17 @@ struct MenuTreeView: View {
                 }
             } else {
                 let row = MenuMetrics.fileLabel(course.id, n.name)
-                Menu(MenuMetrics.fit(row)) {
+                // 点击 = 默认应用打开（primaryAction），悬停 = 右侧「更多打开方式」
+                Menu {
                     if MenuMetrics.truncated(row) {
                         MenuHeader(text: row)
                         Divider()
                     }
                     FileActionsMenu(course: course, node: n)
+                } label: {
+                    Text(MenuMetrics.fit(row))
+                } primaryAction: {
+                    state.openNode(course, n)
                 }
             }
         }
@@ -2988,7 +2901,7 @@ struct FileActionsMenu: View {
     @ObservedObject var state = AppState.shared
 
     var body: some View {
-        // 文件行本身点击 = 默认应用打开（FileRowHook 补 action）；这里列出右侧「更多打开方式」
+        // 文件行本身点击 = 默认应用打开（Menu 的 primaryAction）；这里列出右侧「更多打开方式」
         if let fileURL = existingFileURL {
             let apps = OpenWith.apps(for: fileURL)
             ForEach(Array(apps.prefix(12))) { a in
@@ -3279,7 +3192,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.applicationIconImage = ic
         }
         Cfg.load()
-        FileRowHook.install()
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: syncRoot, withIntermediateDirectories: true)
         log("CanvasBar v\(Updater.currentVersion) 启动 | canvas=\(Cfg.origin) | 库=\(syncRoot.path) | macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
