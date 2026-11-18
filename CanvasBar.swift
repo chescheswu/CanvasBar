@@ -278,6 +278,14 @@ struct UpcomingEvent: Codable, Identifiable, Hashable {
         f.dateFormat = "MM-dd HH:mm"
         return f.string(from: d)
     }
+
+    /// 只到日（一级菜单用；时间放到下级菜单的完整标题里）
+    var shortDueText: String {
+        guard let d = dueDate else { return due }
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd"
+        return f.string(from: d)
+    }
 }
 
 /// 手动添加的 DDL（不依赖 Canvas；courseId=0 表示未指定课程）
@@ -432,16 +440,24 @@ final class AppState: ObservableObject {
     /// 每课新内容总数
     var newTotal: Int { newFiles.values.reduce(0) { $0 + $1.count } }
 
+    /// 一级菜单行：只显示「月-日」，课程与标题保留全名（超宽由 MenuMetrics 省略，全名在下级菜单顶部展开）
     func ddlText(for e: UpcomingEvent) -> String {
         let d = e.daysLeft ?? 0
         let tag = d == 0 ? "今天" : "\(d)天后"
-        var ctag = courses.first { String($0.id) == e.context }?.name ?? ""
-        if ctag.count > 14 { ctag = String(ctag.prefix(13)) + "…" }
-        var t = e.title
-        if t.count > 22 { t = String(t.prefix(20)) + "…" }
+        let ctag = courses.first { String($0.id) == e.context }?.name ?? ""
         let prefix = ctag.isEmpty ? "" : "\(ctag)："
         let mark = isManualDdl(e) ? "✍️ " : ""
-        return "\(mark)\(e.dueText) · \(prefix)\(t)（\(tag)）"
+        return "\(mark)\(e.shortDueText) · \(prefix)\(e.title)（\(tag)）"
+    }
+
+    /// 下级菜单顶部：完整标题（含截止时间与全名）
+    func ddlFullText(for e: UpcomingEvent) -> String {
+        let d = e.daysLeft ?? 0
+        let tag = d == 0 ? "今天截止" : "还有 \(d) 天"
+        let ctag = courses.first { String($0.id) == e.context }?.name ?? ""
+        let prefix = ctag.isEmpty ? "" : "\(ctag)："
+        let mark = isManualDdl(e) ? "✍️ 手动添加 · " : ""
+        return "\(mark)\(e.dueText) · \(prefix)\(e.title)（\(tag)）"
     }
 
     // MARK: 用户操作（DDL 已提交 / 新内容已读 / 同步勾选 / 过滤开关）
@@ -2593,42 +2609,49 @@ enum MenuMetrics {
         return best
     }
 
-    /// 只截尾部（DDL 行：日期与课程名在前，比末尾的天数更重要；悬停可滚动看全）
-    static func fitHead(_ s: String) -> String {
-        guard width(s) > textWidth else { return s }
-        let chars = Array(s)
-        var lo = 1, hi = max(1, chars.count - 1)
-        var best = "…"
-        while lo <= hi {
-            let keep = (lo + hi) / 2
-            let cand = String(chars.prefix(keep)) + "…"
+    /// 下级菜单顶部：一级菜单放不下的完整标题在这里折行（按词断，CJK 无空格时按字断）
+    static func wrap(_ s: String) -> [String] {
+        let t = s.replacingOccurrences(of: "🆕 ", with: "🆕")
+        guard width(t) > textWidth else { return [t] }
+        var lines: [String] = []
+        var line = ""
+        for w in t.split(whereSeparator: { $0 == " " || $0 == "　" }) {
+            let word = String(w)
+            let cand = line.isEmpty ? word : line + " " + word
             if width(cand) <= textWidth {
-                best = cand
-                lo = keep + 1
-            } else {
-                hi = keep - 1
+                line = cand
+                continue
             }
+            if !line.isEmpty {
+                lines.append(line)
+                line = ""
+            }
+            if width(word) <= textWidth {
+                line = word
+                continue
+            }
+            var chunk = ""
+            for ch in word {
+                if width(chunk + String(ch)) <= textWidth {
+                    chunk.append(ch)
+                } else {
+                    lines.append(chunk)
+                    chunk = String(ch)
+                }
+            }
+            line = chunk
         }
-        return best
+        if !line.isEmpty { lines.append(line) }
+        return lines.isEmpty ? [t] : lines
     }
+
+    /// 该行标题在一级菜单里是否会被省略（是则下级菜单顶部补上完整标题）
+    static func truncated(_ s: String) -> Bool { width(s) > textWidth }
 
     /// 文件行显示名（带 🆕 角标）
     @MainActor
     static func fileLabel(_ courseId: Int64, _ name: String) -> String {
         AppState.shared.isNewFile(courseId, name) ? "🆕 " + name : name
-    }
-
-    /// 给定文本在可用宽度里能放下多少字符（滚动窗口长度）
-    static func visibleChars(_ chars: [Character]) -> Int {
-        var n = 0
-        var s = ""
-        while n < chars.count {
-            let cand = s + String(chars[n])
-            if width(cand) > textWidth { break }
-            s = cand
-            n += 1
-        }
-        return max(1, n)
     }
 
     static func folderLabel(_ name: String) -> String { "📁 " + name }
@@ -2654,7 +2677,7 @@ struct FileRef {
     let labels: [String]
 }
 
-/// 菜单打开时：统一各级子菜单宽度，并给文件行补默认打开动作（SwiftUI 不会给带子菜单的项设 action）
+/// 菜单打开时：统一各级菜单宽度，并给文件行补默认打开动作（SwiftUI 不会给带子菜单的项设 action）
 @MainActor
 final class FileRowHook: NSObject {
     static let shared = FileRowHook()
@@ -2666,12 +2689,6 @@ final class FileRowHook: NSObject {
             name: NSMenu.didBeginTrackingNotification,
             object: nil
         )
-        NotificationCenter.default.addObserver(
-            shared,
-            selector: #selector(menuDidEndTracking(_:)),
-            name: NSMenu.didEndTrackingNotification,
-            object: nil
-        )
     }
 
     @objc private func menuDidBeginTracking(_ note: Notification) {
@@ -2680,7 +2697,6 @@ final class FileRowHook: NSObject {
         if menu.minimumWidth < MenuMetrics.submenuWidth {
             menu.minimumWidth = MenuMetrics.submenuWidth
         }
-        MenuMarquee.shared.begin(menu)
         // 文件操作组必有「其他…（选择应用）」；目录组没有
         guard menu.items.contains(where: { $0.title.hasPrefix("其他…") }) else { return }
         guard let host = menu.supermenu?.items.first(where: { $0.submenu === menu }) else { return }
@@ -2689,16 +2705,6 @@ final class FileRowHook: NSObject {
         host.target = FileRowTarget.shared
         host.action = #selector(FileRowTarget.openDefault(_:))
         host.representedObject = ref
-    }
-
-    @objc private func menuDidEndTracking(_ note: Notification) {
-        guard let menu = note.object as? NSMenu else { return }
-        // 子菜单收起后父菜单仍在跟踪，节拍器交回父菜单，否则父级悬停滚动会停摆
-        if let parent = menu.supermenu {
-            MenuMarquee.shared.begin(parent)
-        } else {
-            MenuMarquee.shared.stop()
-        }
     }
 
     /// 从文件行向上走到课程行，收集标签链
@@ -2743,124 +2749,6 @@ final class FileRowHook: NSObject {
 
 // MARK: - 菜单 UI
 
-/// 悬停滚动：菜单项标题被省略时，鼠标停在该行上按节拍改写标题，文字横向循环。
-/// 原生菜单不支持动画；这里只改高亮行（该行本来就会重绘），并按原行宽补空格，菜单宽度不跟着抖。
-@MainActor
-final class MenuMarquee: NSObject {
-    static let shared = MenuMarquee()
-
-    private struct Scroll {
-        let item: NSMenuItem
-        let fitted: String
-        let chars: [Character]
-        let win: Int
-        var offset: Int
-        var shown: String
-    }
-
-    private var timer: Timer?
-    private var menu: NSMenu?
-    private var full: [String: String] = [:]
-    private var scroll: Scroll?
-
-    /// 菜单打开时启动；只跑一个节拍器，靠 highlightedItem 判断当前悬停行
-    func begin(_ menu: NSMenu) {
-        stop()
-        self.menu = menu
-        full = MenuMarquee.fullTexts()
-        let t = Timer(timeInterval: 0.09, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
-        t.tolerance = 0.02
-        RunLoop.main.add(t, forMode: .eventTracking)
-        RunLoop.main.add(t, forMode: .default)
-        timer = t
-    }
-
-    func stop() {
-        timer?.invalidate()
-        timer = nil
-        if let s = scroll { s.item.title = s.fitted }
-        scroll = nil
-        menu = nil
-    }
-
-    @objc private func tick() {
-        guard let menu else { return }
-        let hot = menu.highlightedItem
-        if let s = scroll, s.item === hot {
-            step()
-            return
-        }
-        if let s = scroll { s.item.title = s.fitted }
-        scroll = nil
-        guard let hot, let text = full[hot.title], hot.title != text else { return }
-        let chars = Array(text)
-        scroll = Scroll(item: hot, fitted: hot.title, chars: chars,
-                        win: MenuMetrics.visibleChars(chars), offset: 0, shown: "")
-        step()
-    }
-
-    private func step() {
-        guard var s = scroll else { return }
-        var out = ""
-        var i = s.offset
-        for _ in 0 ..< s.win {
-            out.append(s.chars[i % s.chars.count])
-            i += 1
-        }
-        let target = MenuMetrics.width(s.fitted)
-        var pad = 0
-        while MenuMetrics.width(out) + 7 < target, pad < 24 {
-            out += " "
-            pad += 1
-        }
-        if out != s.shown {
-            s.item.title = out
-            s.shown = out
-        }
-        s.offset += 1
-        scroll = s
-    }
-
-    /// 被省略的标题 → 完整文本（键是菜单里实际显示的省略版）
-    static func fullTexts() -> [String: String] {
-        var map: [String: String] = [:]
-        func put(_ s: String) {
-            let f = MenuMetrics.fit(s)
-            if f != s { map[f] = s }
-        }
-        let st = AppState.shared
-        put("Canvas 课业同步 · \(st.lastSyncText)")
-        put("⏰ 暂无近期待办")
-        put("⏰ 最近 DDL（点开可标记已提交）")
-        for e in st.upcomingSoon.prefix(5) {
-            let s = "📅  " + st.ddlText(for: e)
-            let f = MenuMetrics.fitHead(s)
-            if f != s { map[f] = s }
-        }
-        put("➕ 添加 Deadline…（选课程与日期）")
-        put("↩️ 恢复已忽略的 DDL（\(st.ddlDone.count)）")
-        put("✅ 新内容全部标为已读（\(st.newTotal)）")
-        put("📏 跳过 ≥\(bigFileLimitMB)MB 文件（保留在线链接）")
-        put("⚙️ 设置 Canvas 域名…（\(Cfg.host)）")
-        func walk(_ nodes: [MenuNode], _ cid: Int64) {
-            for n in nodes {
-                if n.isDir {
-                    put(MenuMetrics.folderLabel(n.name))
-                    walk(n.children, cid)
-                } else {
-                    put(MenuMetrics.fileLabel(cid, n.name))
-                }
-            }
-        }
-        for c in st.courses {
-            put(courseMenuLabel(c))
-            for l in st.linksFor(c.id) { put("🔗 \(l.title)") }
-            walk(st.menuNodes(for: c), c.id)
-        }
-        return map
-    }
-}
-
 /// 课程行标题（根菜单与省略映射共用，避免两处各写一份）
 @MainActor
 func courseMenuLabel(_ c: CachedCourse) -> String {
@@ -2868,6 +2756,27 @@ func courseMenuLabel(_ c: CachedCourse) -> String {
     let n = st.newFiles[c.id]?.count ?? 0
     let off = st.syncDisabled.contains(c.id) ? "　⏸" : ""
     return n > 0 ? "📚  \(c.name)　🆕 \(n)\(off)" : "📚  \(c.name)\(off)"
+}
+
+/// 课程子菜单顶部：课程全名（含新内容数 / 停止同步标记），一级菜单放不下时才出现
+@MainActor
+func courseHeader(_ c: CachedCourse) -> String {
+    let st = AppState.shared
+    let n = st.newFiles[c.id]?.count ?? 0
+    let off = st.syncDisabled.contains(c.id) ? "（已停止同步）" : ""
+    return n > 0 ? "\(c.name)　🆕 \(n)\(off)" : "\(c.name)\(off)"
+}
+
+/// 下级菜单顶部的完整标题：一级菜单放不下的内容在这里换行显示；其余菜单项一律单行省略
+struct MenuHeader: View {
+    let text: String
+
+    var body: some View {
+        let lines = MenuMetrics.wrap(text)
+        ForEach(lines.indices, id: \.self) { i in
+            Text(lines[i]).disabled(true)
+        }
+    }
 }
 
 struct MenuContent: View {
@@ -2884,7 +2793,12 @@ struct MenuContent: View {
         } else {
             Text(MenuMetrics.fit("⏰ 最近 DDL（点开可标记已提交）"))
             ForEach(Array(state.upcomingSoon.prefix(5))) { e in
-                Menu(MenuMetrics.fitHead("📅  " + state.ddlText(for: e))) {
+                let row = "📅  " + state.ddlText(for: e)
+                Menu(MenuMetrics.fit(row)) {
+                    if MenuMetrics.truncated(row) {
+                        MenuHeader(text: state.ddlFullText(for: e))
+                        Divider()
+                    }
                     if let s = e.url, !s.isEmpty, let u = URL(string: s) {
                         Button(MenuMetrics.fit("🌐 在 Canvas 打开")) { NSWorkspace.shared.open(u) }
                     }
@@ -2904,7 +2818,12 @@ struct MenuContent: View {
         Divider()
 
         ForEach(state.courses) { c in
-            Menu(MenuMetrics.fit(courseMenuLabel(c))) {
+            let row = courseMenuLabel(c)
+            Menu(MenuMetrics.fit(row)) {
+                if MenuMetrics.truncated(row) {
+                    MenuHeader(text: courseHeader(c))
+                    Divider()
+                }
                 Button(MenuMetrics.fit("🌐 在 Canvas 打开课程")) {
                     openOnCanvas(c)
                 }
@@ -3028,13 +2947,23 @@ struct MenuTreeView: View {
     var body: some View {
         ForEach(nodes) { n in
             if n.isDir {
-                Menu(MenuMetrics.fit(MenuMetrics.folderLabel(n.name))) {
+                let row = MenuMetrics.folderLabel(n.name)
+                Menu(MenuMetrics.fit(row)) {
+                    if MenuMetrics.truncated(row) {
+                        MenuHeader(text: row)
+                        Divider()
+                    }
                     MenuTreeView(nodes: n.children, course: course)
                     Divider()
                     Button(MenuMetrics.fit("📍 在 Finder 中显示")) { state.revealNode(course, n) }
                 }
             } else {
-                Menu(MenuMetrics.fit(MenuMetrics.fileLabel(course.id, n.name))) {
+                let row = MenuMetrics.fileLabel(course.id, n.name)
+                Menu(MenuMetrics.fit(row)) {
+                    if MenuMetrics.truncated(row) {
+                        MenuHeader(text: row)
+                        Divider()
+                    }
                     FileActionsMenu(course: course, node: n)
                 }
             }
