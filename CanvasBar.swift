@@ -2556,6 +2556,141 @@ enum Updater {
     }
 }
 
+// MARK: - 菜单尺寸（v2.11）
+
+/// 各级子菜单统一宽度：约根菜单（≈460pt）的 2/3。
+/// 菜单项标题超出可用宽度时按中段省略，避免长文件名把整级菜单一路撑宽。
+enum MenuMetrics {
+    /// 子菜单目标宽度
+    static let submenuWidth: CGFloat = 300
+    /// 菜单项文本可用宽度（扣掉菜单左右内边距与图标位）
+    static let textWidth: CGFloat = 250
+
+    static let font = NSFont.menuFont(ofSize: 0)
+
+    static func width(_ s: String) -> CGFloat {
+        (s as NSString).size(withAttributes: [.font: font]).width
+    }
+
+    /// 超宽时保留头部 60% / 尾部 40%，中间以 … 省略（尾部保留扩展名等信息）
+    static func fit(_ s: String) -> String {
+        guard width(s) > textWidth else { return s }
+        let chars = Array(s)
+        var lo = 1, hi = max(1, chars.count - 1)
+        var best = "…"
+        while lo <= hi {
+            let keep = (lo + hi) / 2
+            let head = max(1, Int((Double(keep) * 0.6).rounded()))
+            let tail = max(0, keep - head)
+            let cand = String(chars.prefix(head)) + "…" + (tail > 0 ? String(chars.suffix(tail)) : "")
+            if width(cand) <= textWidth {
+                best = cand
+                lo = keep + 1
+            } else {
+                hi = keep - 1
+            }
+        }
+        return best
+    }
+
+    /// 文件行显示名（带 🆕 角标）
+    @MainActor
+    static func fileLabel(_ courseId: Int64, _ name: String) -> String {
+        AppState.shared.isNewFile(courseId, name) ? "🆕 " + name : name
+    }
+
+    static func folderLabel(_ name: String) -> String { "📁 " + name }
+}
+
+/// 文件行点击目标：点击 = 默认应用打开，悬停 = 右侧展开「更多打开方式」。
+/// AppKit 对带 submenu 的菜单项默认只在点击时展开子菜单，改写 action 后点击即执行主操作。
+@MainActor
+final class FileRowTarget: NSObject {
+    static let shared = FileRowTarget()
+
+    @objc func openDefault(_ sender: NSMenuItem) {
+        guard let r = sender.representedObject as? FileRef,
+              let node = FileRowHook.resolve(courseId: r.courseId, labels: r.labels),
+              let course = AppState.shared.courses.first(where: { $0.id == r.courseId }) else { return }
+        AppState.shared.openNode(course, node)
+    }
+}
+
+struct FileRef {
+    let courseId: Int64
+    /// 从课程下到该文件的菜单标签链（已按显示宽度省略）
+    let labels: [String]
+}
+
+/// 菜单打开时：统一各级子菜单宽度，并给文件行补默认打开动作（SwiftUI 不会给带子菜单的项设 action）
+@MainActor
+final class FileRowHook: NSObject {
+    static let shared = FileRowHook()
+
+    static func install() {
+        NotificationCenter.default.addObserver(
+            shared,
+            selector: #selector(menuDidBeginTracking(_:)),
+            name: NSMenu.didBeginTrackingNotification,
+            object: nil
+        )
+    }
+
+    @objc private func menuDidBeginTracking(_ note: Notification) {
+        guard let menu = note.object as? NSMenu else { return }
+        // 根菜单保持自适应宽度，作为基准；其余各级统一到 submenuWidth
+        if menu.supermenu != nil, menu.minimumWidth < MenuMetrics.submenuWidth {
+            menu.minimumWidth = MenuMetrics.submenuWidth
+        }
+        // 文件操作组必有「其他…（选择应用）」；目录组没有
+        guard menu.items.contains(where: { $0.title.hasPrefix("其他…") }) else { return }
+        guard let host = menu.supermenu?.items.first(where: { $0.submenu === menu }) else { return }
+        if let a = host.action, a != #selector(NSMenu.submenuAction(_:)) { return }
+        guard let ref = ref(for: host) else { return }
+        host.target = FileRowTarget.shared
+        host.action = #selector(FileRowTarget.openDefault(_:))
+        host.representedObject = ref
+    }
+
+    /// 从文件行向上走到课程行，收集标签链
+    private func ref(for item: NSMenuItem) -> FileRef? {
+        var labels = [item.title]
+        var row = item
+        while let parentMenu = row.menu {
+            guard let owner = parentMenu.supermenu?.items.first(where: { $0.submenu === parentMenu }) else { return nil }
+            let t = owner.title
+            if t.hasPrefix("📚") {
+                // 根菜单课程行未做省略，按最长名匹配，避免前缀相同的课串行
+                guard let c = AppState.shared.courses
+                    .filter({ t.contains($0.name) })
+                    .max(by: { $0.name.count < $1.name.count }) else { return nil }
+                return FileRef(courseId: c.id, labels: labels)
+            }
+            guard t.hasPrefix("📁") else { return nil }
+            labels.insert(t, at: 0)
+            row = owner
+        }
+        return nil
+    }
+
+    /// 标签链 → MenuNode：用与菜单构建相同的省略规则重算，逐级比对
+    static func resolve(courseId: Int64, labels: [String]) -> MenuNode? {
+        guard let c = AppState.shared.courses.first(where: { $0.id == courseId }) else { return nil }
+        func walk(_ nodes: [MenuNode], _ prefix: [String]) -> MenuNode? {
+            for n in nodes {
+                if n.isDir {
+                    let p = prefix + [MenuMetrics.fit(MenuMetrics.folderLabel(n.name))]
+                    if let hit = walk(n.children, p) { return hit }
+                } else if prefix + [MenuMetrics.fit(MenuMetrics.fileLabel(courseId, n.name))] == labels {
+                    return n
+                }
+            }
+            return nil
+        }
+        return walk(AppState.shared.menuNodes(for: c), [])
+    }
+}
+
 // MARK: - 菜单 UI
 
 struct MenuContent: View {
@@ -2574,12 +2709,12 @@ struct MenuContent: View {
             ForEach(Array(state.upcomingSoon.prefix(5))) { e in
                 Menu("📅  " + state.ddlText(for: e)) {
                     if let s = e.url, !s.isEmpty, let u = URL(string: s) {
-                        Button("🌐 在 Canvas 打开") { NSWorkspace.shared.open(u) }
+                        Button(MenuMetrics.fit("🌐 在 Canvas 打开")) { NSWorkspace.shared.open(u) }
                     }
-                    Button("✅ 标记为已提交（不再提醒）") { state.markDdlDone(e) }
+                    Button(MenuMetrics.fit("✅ 标记为已提交（不再提醒）")) { state.markDdlDone(e) }
                     if state.isManualDdl(e) {
                         Divider()
-                        Button("🗑 删除此 Deadline") { state.removeManualDdl(e) }
+                        Button(MenuMetrics.fit("🗑 删除此 Deadline")) { state.removeManualDdl(e) }
                     }
                 }
             }
@@ -2593,15 +2728,15 @@ struct MenuContent: View {
 
         ForEach(state.courses) { c in
             Menu(courseLabel(c)) {
-                Button("🌐 在 Canvas 打开课程") {
+                Button(MenuMetrics.fit("🌐 在 Canvas 打开课程")) {
                     openOnCanvas(c)
                 }
-                Button("📂 打开课程文件夹") {
+                Button(MenuMetrics.fit("📂 打开课程文件夹")) {
                     openFolder(c.url)
                     state.clearNew(c.id)
                 }
                 if !state.syncDisabled.contains(c.id) {
-                    Button("🔄 立即同步此课程") {
+                    Button(MenuMetrics.fit("🔄 立即同步此课程")) {
                         Task { await SyncEngine.shared.syncAll(only: [c.id]) }
                     }
                     .disabled(state.isSyncing)
@@ -2610,7 +2745,7 @@ struct MenuContent: View {
                 if !extLinks.isEmpty {
                     Divider()
                     ForEach(extLinks) { l in
-                        Button("🔗 \(l.title)") {
+                        Button(MenuMetrics.fit("🔗 \(l.title)")) {
                             if let u = URL(string: l.url) {
                                 NSWorkspace.shared.open(u)
                                 log("菜单打开外部链接: \(l.url)")
@@ -2621,20 +2756,20 @@ struct MenuContent: View {
                 let nodes = state.menuNodes(for: c)
                 if nodes.isEmpty {
                     Divider()
-                    Button("（暂无同步文件）") {}.disabled(true)
+                    Button(MenuMetrics.fit("（暂无同步文件）")) {}.disabled(true)
                 } else {
                     Divider()
                     MenuTreeView(nodes: nodes, course: c)
                 }
                 Divider()
                 if state.syncDisabled.contains(c.id) {
-                    Button("✅ 恢复同步该课程") {
+                    Button(MenuMetrics.fit("✅ 恢复同步该课程")) {
                         state.setSyncEnabled(c.id, true)
                         state.progress = "已恢复同步：\(c.name)"
                         log("用户恢复课程同步: \(c.name) [\(c.id)]")
                     }
                 } else {
-                    Button("🚫 关闭该课程（停止同步）…") { CoursesUI.confirmClose(c) }
+                    Button(MenuMetrics.fit("🚫 关闭该课程（停止同步）…")) { CoursesUI.confirmClose(c) }
                 }
             }
         }
@@ -2652,7 +2787,7 @@ struct MenuContent: View {
 
         Menu("☑️ 同步范围（按课程勾选）") {
             ForEach(state.courses) { c in
-                Toggle(c.name, isOn: Binding(
+                Toggle(MenuMetrics.fit(c.name), isOn: Binding(
                     get: { !state.syncDisabled.contains(c.id) },
                     set: { state.setSyncEnabled(c.id, $0) }))
             }
@@ -2720,13 +2855,13 @@ struct MenuTreeView: View {
     var body: some View {
         ForEach(nodes) { n in
             if n.isDir {
-                Menu("📁 " + n.name) {
+                Menu(MenuMetrics.fit(MenuMetrics.folderLabel(n.name))) {
                     MenuTreeView(nodes: n.children, course: course)
                     Divider()
-                    Button("📍 在 Finder 中显示") { state.revealNode(course, n) }
+                    Button(MenuMetrics.fit("📍 在 Finder 中显示")) { state.revealNode(course, n) }
                 }
             } else {
-                Menu(state.isNewFile(course.id, n.name) ? "🆕 \(n.name)" : n.name) {
+                Menu(MenuMetrics.fit(MenuMetrics.fileLabel(course.id, n.name))) {
                     FileActionsMenu(course: course, node: n)
                 }
             }
@@ -2741,29 +2876,28 @@ struct FileActionsMenu: View {
     @ObservedObject var state = AppState.shared
 
     var body: some View {
-        Button("打开（默认应用）") { state.openNode(course, node) }
+        // 文件行本身点击 = 默认应用打开（FileRowHook 补 action）；这里列出右侧「更多打开方式」
         if let fileURL = existingFileURL {
             let apps = OpenWith.apps(for: fileURL)
-            if !apps.isEmpty {
-                Menu("打开方式") {
-                    ForEach(Array(apps.prefix(12))) { a in
-                        Button {
-                            OpenWith.open(fileURL, with: a.url)
-                        } label: {
-                            Label {
-                                Text(a.isDefault ? "\(a.name)（默认）" : a.name)
-                            } icon: {
-                                Image(nsImage: NSWorkspace.shared.icon(forFile: a.url.path))
-                            }
-                        }
+            ForEach(Array(apps.prefix(12))) { a in
+                Button {
+                    OpenWith.open(fileURL, with: a.url)
+                } label: {
+                    Label {
+                        Text(MenuMetrics.fit(a.isDefault ? "\(a.name)（默认）" : a.name))
+                    } icon: {
+                        Image(nsImage: NSWorkspace.shared.icon(forFile: a.url.path))
                     }
-                    Divider()
-                    Button("其他…（选择应用）") { OpenWith.chooseAppAndOpen(fileURL) }
                 }
             }
+            if !apps.isEmpty { Divider() }
+            Button(MenuMetrics.fit("其他…（选择应用）")) { OpenWith.chooseAppAndOpen(fileURL) }
+        } else {
+            // 路径失效时仍保留此项：既是提示，也是文件行的识别标记（点击文件行走路径自愈）
+            Button(MenuMetrics.fit("其他…（选择应用）")) {}.disabled(true)
         }
         Divider()
-        Button("📍 在 Finder 中显示") { state.revealNode(course, node) }
+        Button(MenuMetrics.fit("📍 在 Finder 中显示")) { state.revealNode(course, node) }
     }
 
     /// 文件当前有效路径（失效则不给「打开方式」列表，打开仍可走自愈找回）
@@ -2937,6 +3071,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.applicationIconImage = ic
         }
         Cfg.load()
+        FileRowHook.install()
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: syncRoot, withIntermediateDirectories: true)
         log("CanvasBar v\(Updater.currentVersion) 启动 | canvas=\(Cfg.origin) | 库=\(syncRoot.path) | macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
