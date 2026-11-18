@@ -1421,15 +1421,20 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     /// 登录页加载完：钥匙串里有凭据就直接填进表单，免手打。
     /// ADFS 有时在 load 完再清一次表单，1.2 秒后补填一次。
     func autoFillLogin(on wv: WKWebView) {
-        guard let v = LoginVault.load() else {
-            log("登录页自动填充: 钥匙串无凭据（菜单 →「设置 Canvas 登录账号…」）")
-            return
-        }
-        fillLoginForm(on: wv, user: v.user, password: v.password)
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            guard self.loginWV === wv, !self.loginFinished else { return }
+        LoginVault.load { [weak self] v in
+            guard let self, self.loginWV === wv, !self.loginFinished else { return }
+            guard let v else {
+                if LoginVault.takeMissingNotice() {
+                    log("登录页自动填充: 钥匙串无凭据（菜单 →「设置 Canvas 登录账号…」）")
+                }
+                return
+            }
             self.fillLoginForm(on: wv, user: v.user, password: v.password)
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                guard self.loginWV === wv, !self.loginFinished else { return }
+                self.fillLoginForm(on: wv, user: v.user, password: v.password)
+            }
         }
     }
 
@@ -1466,8 +1471,14 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     func handleLoginMessage(kind: String, body: [String: Any]) {
         switch kind {
         case "fill":
-            guard let v = LoginVault.load() else { log("登录页填充: 钥匙串无记录"); return }
-            fillLoginForm(on: loginWV, user: v.user, password: v.password)
+            LoginVault.load { [weak self] v in
+                guard let self else { return }
+                guard let v else {
+                    if LoginVault.takeMissingNotice() { log("登录页填充: 钥匙串无记录") }
+                    return
+                }
+                self.fillLoginForm(on: self.loginWV, user: v.user, password: v.password)
+            }
         case "credentials":
             let u = body["user"] as? String ?? ""
             let p = body["pass"] as? String ?? ""
@@ -3342,6 +3353,49 @@ struct VaultCredential {
 enum LoginVault {
     private static let service = "local.chester.canvasbar.canvas"
 
+    // SecItemCopyMatching 在授权弹窗上会一直阻塞；而登录页每完成一次加载就调一次
+    // autoFillLogin（SAML 递交页循环时几秒一次）。不收敛的话每几秒弹一个新窗，
+    // 前一个窗的输入焦点被顶掉，密码框就成了「打不进字」。
+    // 所以：一次启动只真正读一次，弹窗未答完不再叠加新请求，读完（成功/失败）即定型。
+    private static var cache: VaultCredential?
+    private static var didAttempt = false
+    private static var loading = false
+    private static var waiters: [(VaultCredential?) -> Void] = []
+    private static var missingNoticeShown = false
+
+    /// 异步读取。必须异步：钥匙串弹窗出现期间主线程会一直卡在这一个调用里。
+    static func load(_ done: @escaping (VaultCredential?) -> Void) {
+        if !Thread.isMainThread { DispatchQueue.main.async { load(done) }; return }
+        if let c = cache { done(c); return }
+        if didAttempt { done(nil); return }
+        if loading { waiters.append(done); return }
+        loading = true
+        waiters.append(done)
+        DispatchQueue.global(qos: .userInitiated).async {
+            log("钥匙串读取: 开始（首次会弹授权窗，答完前不再重复请求）")
+            let v = readKeychain()
+            DispatchQueue.main.async {
+                loading = false
+                didAttempt = true
+                cache = v
+                log("钥匙串读取: 结束（\(v == nil ? "无凭据" : "已取到")）")
+                let ws = waiters
+                waiters = []
+                ws.forEach { $0(v) }
+            }
+        }
+    }
+
+    /// 只取内存里的值，不触发弹窗（菜单设置面板预填用）
+    static var cached: VaultCredential? { cache }
+
+    /// 读不到时只提示一次，避免每次页面加载都写一行日志
+    static func takeMissingNotice() -> Bool {
+        if missingNoticeShown { return false }
+        missingNoticeShown = true
+        return true
+    }
+
     static func save(user: String, password: String) {
         guard let data = password.data(using: .utf8) else { return }
         let base: [String: Any] = [
@@ -3354,9 +3408,12 @@ enum LoginVault {
         add[kSecValueData as String] = data
         add[kSecAttrLabel as String] = "CanvasBar · Canvas 登录"
         SecItemAdd(add as CFDictionary, nil)
+        cache = VaultCredential(user: user, password: password)
+        didAttempt = true
+        missingNoticeShown = false
     }
 
-    static func load() -> VaultCredential? {
+    private static func readKeychain() -> VaultCredential? {
         let q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -3378,6 +3435,8 @@ enum LoginVault {
             kSecAttrService as String: service,
         ]
         SecItemDelete(q as CFDictionary)
+        cache = nil
+        didAttempt = true
     }
 }
 
@@ -3398,7 +3457,7 @@ enum LoginVaultUI {
         user.placeholderString = "账号（例：25123456d@connect.polyu.hk）"
         let pass = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
         pass.placeholderString = "密码"
-        if let v = LoginVault.load() { user.stringValue = v.user }
+        if let v = LoginVault.cached { user.stringValue = v.user }
         box.addSubview(user)
         box.addSubview(pass)
         a.accessoryView = box
