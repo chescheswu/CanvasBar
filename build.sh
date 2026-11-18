@@ -27,7 +27,7 @@ cat > "$APPDIR/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleName</key><string>CanvasBar</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.13.2</string>
+    <key>CFBundleShortVersionString</key><string>2.14.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHumanReadableCopyright</key><string>Chester</string>
 </dict>
