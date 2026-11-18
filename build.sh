@@ -27,7 +27,7 @@ cat > "$APPDIR/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleName</key><string>CanvasBar</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.12.0</string>
+    <key>CFBundleShortVersionString</key><string>2.13.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHumanReadableCopyright</key><string>Chester</string>
 </dict>
@@ -35,5 +35,9 @@ cat > "$APPDIR/Contents/Info.plist" <<'PLIST'
 PLIST
 
 codesign --force -s - "$APPDIR" 2>/dev/null || true
+
+# 不在 LaunchServices 里留 .build 副本的登记（否则「打开方式」会指到构建目录）
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -u "$APPDIR" >/dev/null 2>&1 || true
 
 echo "Built: $APPDIR"

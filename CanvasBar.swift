@@ -3159,6 +3159,102 @@ struct CanvasBarApp: App {
     }
 }
 
+// MARK: - 同一环境只留一份安装（v2.13）
+
+/// 同一台机器只允许存在一份 CanvasBar.app（只看标准安装目录，开发用的 .build 副本不参与），
+/// 扫到第二份就在启动时提示并（默认）移入废纸篓；选「保留」会把 path|版本 记进
+/// version-guard.json，之后不再重复问。移入废纸篓走 FileManager.trashItem，可撤销。
+@MainActor
+enum SingleVersion {
+    /// 视为「已安装」的目录
+    private static var installDirs: [URL] {
+        [URL(fileURLWithPath: "/Applications", isDirectory: true),
+         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true),
+         URL(fileURLWithPath: "/Users/Shared", isDirectory: true)]
+    }
+
+    private static var recordURL: URL { supportDir.appendingPathComponent("version-guard.json") }
+
+    private struct Copy {
+        let url: URL
+        let version: String
+        var key: String { url.path + "|" + version }
+    }
+
+    private static func copies() -> [Copy] {
+        installDirs.compactMap { dir in
+            let u = dir.appendingPathComponent("CanvasBar.app", isDirectory: true).resolvingSymlinksInPath()
+            guard FileManager.default.fileExists(atPath: u.path) else { return nil }
+            let v = Bundle(url: u)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+            return Copy(url: u, version: v ?? "?")
+        }
+    }
+
+    private static func ignored() -> Set<String> {
+        guard let d = try? Data(contentsOf: recordURL),
+              let a = try? JSONDecoder().decode([String].self, from: d) else { return [] }
+        return Set(a)
+    }
+
+    private static func remember(_ keys: [String]) {
+        let all = Array(ignored().union(keys))
+        guard let d = try? JSONEncoder().encode(all) else { return }
+        try? d.write(to: recordURL, options: .atomic)
+    }
+
+    /// 启动时调用。只有当前运行的就是标准安装副本时才动手，免得开发构建把装好的那份删掉。
+    static func enforce() {
+        let me = Bundle.main.bundleURL.resolvingSymlinksInPath()
+        let all = copies()
+        guard all.contains(where: { $0.url.path == me.path }) else {
+            log("版本守卫：当前副本不在标准安装目录（\(me.path)），跳过")
+            return
+        }
+        let others = all.filter { $0.url.path != me.path }
+        guard !others.isEmpty else {
+            log("版本守卫：安装目录只有一份（v\(Updater.currentVersion)）")
+            return
+        }
+        let skip = ignored()
+        let todo = others.filter { !skip.contains($0.key) }
+        guard !todo.isEmpty else {
+            log("版本守卫：另有 \(others.count) 份副本，均已被用户标记保留")
+            return
+        }
+
+        let list = todo.map { "· \($0.url.path)（v\($0.version)）" }.joined(separator: "\n")
+        log("版本守卫：发现 \(todo.count) 份多余安装 → \(list.replacingOccurrences(of: "\n", with: " / "))")
+
+        // 测试钩子：只记日志，不弹窗
+        if ProcessInfo.processInfo.environment["CANVASBAR_GUARD_DRYRUN"] == "1" {
+            log("版本守卫：DRYRUN，跳过弹窗")
+            return
+        }
+
+        let a = NSAlert()
+        a.messageText = "同一环境只保留一份 CanvasBar"
+        a.informativeText = "检测到另外 \(todo.count) 份安装（当前运行 \(me.path) · v\(Updater.currentVersion)）：\n\(list)\n\n移入废纸篓会保留可撤销的副本，不影响当前这份。"
+        a.addButton(withTitle: "移入废纸篓")
+        a.addButton(withTitle: "保留，不再提示")
+        NSApp.activate(ignoringOtherApps: true)
+        let choice = a.runModal()
+
+        guard choice == .alertFirstButtonReturn else {
+            remember(todo.map(\.key))
+            log("版本守卫：用户选择保留 \(todo.map(\.url.path).joined(separator: ", "))")
+            return
+        }
+        for c in todo {
+            do {
+                try FileManager.default.trashItem(at: c.url, resultingItemURL: nil)
+                log("版本守卫：已移入废纸篓 \(c.url.path)（v\(c.version)）")
+            } catch {
+                log("版本守卫：移入废纸篓失败 \(c.url.path) — \(error.localizedDescription)")
+            }
+        }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var timer: Timer?
 
@@ -3177,6 +3273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: syncRoot, withIntermediateDirectories: true)
         log("CanvasBar v\(Updater.currentVersion) 启动 | canvas=\(Cfg.origin) | 库=\(syncRoot.path) | macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        SingleVersion.enforce()   // 同一环境只留一份安装（多余副本提示移入废纸篓）
         AppState.shared.reloadManifest()
         let mi = AppState.shared.manifest
         log("菜单文件索引: \(mi.count) 门课 / \(mi.values.reduce(0) { $0 + $1.count }) 个文件")
