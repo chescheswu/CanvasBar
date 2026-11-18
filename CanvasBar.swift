@@ -2222,20 +2222,30 @@ enum OpenWith {
 
     private static var cache: [String: [AppOption]] = [:]
 
-    /// 能打开该文件的 App：默认 App 置顶（标记 isDefault），其余按名称排序
+    /// 菜单里显示的 App 名：去掉 .app 后缀
+    static func displayName(_ appURL: URL) -> String {
+        var n = FileManager.default.displayName(atPath: appURL.path)
+        if n.hasSuffix(".app") { n.removeLast(4) }
+        return n
+    }
+
+    /// 能打开该文件的 App：默认 App 置顶（标记 isDefault），其余按名称排序；同名只留一份
     static func apps(for fileURL: URL) -> [AppOption] {
         if let c = cache[fileURL.path] { return c }
         let ws = NSWorkspace.shared
-        let fm = FileManager.default
+        var seen = Set<String>()
         var out: [AppOption] = []
         if let d = ws.urlForApplication(toOpen: fileURL) {
-            out.append(AppOption(url: d, name: fm.displayName(atPath: d.path), isDefault: true))
+            let n = displayName(d)
+            seen.insert(n)
+            out.append(AppOption(url: d, name: n, isDefault: true))
         }
-        var seen = Set(out.map { $0.url.path })
         var rest: [AppOption] = []
-        for u in ws.urlsForApplications(toOpen: fileURL) where !seen.contains(u.path) {
-            seen.insert(u.path)
-            rest.append(AppOption(url: u, name: fm.displayName(atPath: u.path), isDefault: false))
+        for u in ws.urlsForApplications(toOpen: fileURL) {
+            let n = displayName(u)
+            guard !seen.contains(n) else { continue }   // 同一 App 装了两份（/Applications 与 ~/Applications）只列一次
+            seen.insert(n)
+            rest.append(AppOption(url: u, name: n, isDefault: false))
         }
         rest.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         out.append(contentsOf: rest)
@@ -2244,7 +2254,7 @@ enum OpenWith {
     }
 
     static func open(_ fileURL: URL, with appURL: URL) {
-        let appName = FileManager.default.displayName(atPath: appURL.path)
+        let appName = displayName(appURL)
         NSWorkspace.shared.open([fileURL], withApplicationAt: appURL,
                                 configuration: NSWorkspace.OpenConfiguration()) { _, err in
             if let err {
