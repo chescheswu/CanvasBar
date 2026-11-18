@@ -2593,10 +2593,42 @@ enum MenuMetrics {
         return best
     }
 
+    /// 只截尾部（DDL 行：日期与课程名在前，比末尾的天数更重要；悬停可滚动看全）
+    static func fitHead(_ s: String) -> String {
+        guard width(s) > textWidth else { return s }
+        let chars = Array(s)
+        var lo = 1, hi = max(1, chars.count - 1)
+        var best = "…"
+        while lo <= hi {
+            let keep = (lo + hi) / 2
+            let cand = String(chars.prefix(keep)) + "…"
+            if width(cand) <= textWidth {
+                best = cand
+                lo = keep + 1
+            } else {
+                hi = keep - 1
+            }
+        }
+        return best
+    }
+
     /// 文件行显示名（带 🆕 角标）
     @MainActor
     static func fileLabel(_ courseId: Int64, _ name: String) -> String {
         AppState.shared.isNewFile(courseId, name) ? "🆕 " + name : name
+    }
+
+    /// 给定文本在可用宽度里能放下多少字符（滚动窗口长度）
+    static func visibleChars(_ chars: [Character]) -> Int {
+        var n = 0
+        var s = ""
+        while n < chars.count {
+            let cand = s + String(chars[n])
+            if width(cand) > textWidth { break }
+            s = cand
+            n += 1
+        }
+        return max(1, n)
     }
 
     static func folderLabel(_ name: String) -> String { "📁 " + name }
@@ -2634,14 +2666,21 @@ final class FileRowHook: NSObject {
             name: NSMenu.didBeginTrackingNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            shared,
+            selector: #selector(menuDidEndTracking(_:)),
+            name: NSMenu.didEndTrackingNotification,
+            object: nil
+        )
     }
 
     @objc private func menuDidBeginTracking(_ note: Notification) {
         guard let menu = note.object as? NSMenu else { return }
-        // 根菜单保持自适应宽度，作为基准；其余各级统一到 submenuWidth
-        if menu.supermenu != nil, menu.minimumWidth < MenuMetrics.submenuWidth {
+        // 各级菜单统一 300pt（含根菜单）
+        if menu.minimumWidth < MenuMetrics.submenuWidth {
             menu.minimumWidth = MenuMetrics.submenuWidth
         }
+        MenuMarquee.shared.begin(menu)
         // 文件操作组必有「其他…（选择应用）」；目录组没有
         guard menu.items.contains(where: { $0.title.hasPrefix("其他…") }) else { return }
         guard let host = menu.supermenu?.items.first(where: { $0.submenu === menu }) else { return }
@@ -2652,6 +2691,16 @@ final class FileRowHook: NSObject {
         host.representedObject = ref
     }
 
+    @objc private func menuDidEndTracking(_ note: Notification) {
+        guard let menu = note.object as? NSMenu else { return }
+        // 子菜单收起后父菜单仍在跟踪，节拍器交回父菜单，否则父级悬停滚动会停摆
+        if let parent = menu.supermenu {
+            MenuMarquee.shared.begin(parent)
+        } else {
+            MenuMarquee.shared.stop()
+        }
+    }
+
     /// 从文件行向上走到课程行，收集标签链
     private func ref(for item: NSMenuItem) -> FileRef? {
         var labels = [item.title]
@@ -2660,11 +2709,12 @@ final class FileRowHook: NSObject {
             guard let owner = parentMenu.supermenu?.items.first(where: { $0.submenu === parentMenu }) else { return nil }
             let t = owner.title
             if t.hasPrefix("📚") {
-                // 根菜单课程行未做省略，按最长名匹配，避免前缀相同的课串行
-                guard let c = AppState.shared.courses
-                    .filter({ t.contains($0.name) })
-                    .max(by: { $0.name.count < $1.name.count }) else { return nil }
-                return FileRef(courseId: c.id, labels: labels)
+                // 课程行标题已按宽度省略，改按「根菜单里 📚 行的顺序」对应 courses（顺序即 ForEach 顺序）
+                guard let root = parentMenu.supermenu else { return nil }
+                let rows = root.items.filter { $0.title.hasPrefix("📚") }
+                guard let idx = rows.firstIndex(where: { $0 === owner }),
+                      idx < AppState.shared.courses.count else { return nil }
+                return FileRef(courseId: AppState.shared.courses[idx].id, labels: labels)
             }
             guard t.hasPrefix("📁") else { return nil }
             labels.insert(t, at: 0)
@@ -2693,21 +2743,148 @@ final class FileRowHook: NSObject {
 
 // MARK: - 菜单 UI
 
+/// 悬停滚动：菜单项标题被省略时，鼠标停在该行上按节拍改写标题，文字横向循环。
+/// 原生菜单不支持动画；这里只改高亮行（该行本来就会重绘），并按原行宽补空格，菜单宽度不跟着抖。
+@MainActor
+final class MenuMarquee: NSObject {
+    static let shared = MenuMarquee()
+
+    private struct Scroll {
+        let item: NSMenuItem
+        let fitted: String
+        let chars: [Character]
+        let win: Int
+        var offset: Int
+        var shown: String
+    }
+
+    private var timer: Timer?
+    private var menu: NSMenu?
+    private var full: [String: String] = [:]
+    private var scroll: Scroll?
+
+    /// 菜单打开时启动；只跑一个节拍器，靠 highlightedItem 判断当前悬停行
+    func begin(_ menu: NSMenu) {
+        stop()
+        self.menu = menu
+        full = MenuMarquee.fullTexts()
+        let t = Timer(timeInterval: 0.09, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
+        t.tolerance = 0.02
+        RunLoop.main.add(t, forMode: .eventTracking)
+        RunLoop.main.add(t, forMode: .default)
+        timer = t
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        if let s = scroll { s.item.title = s.fitted }
+        scroll = nil
+        menu = nil
+    }
+
+    @objc private func tick() {
+        guard let menu else { return }
+        let hot = menu.highlightedItem
+        if let s = scroll, s.item === hot {
+            step()
+            return
+        }
+        if let s = scroll { s.item.title = s.fitted }
+        scroll = nil
+        guard let hot, let text = full[hot.title], hot.title != text else { return }
+        let chars = Array(text)
+        scroll = Scroll(item: hot, fitted: hot.title, chars: chars,
+                        win: MenuMetrics.visibleChars(chars), offset: 0, shown: "")
+        step()
+    }
+
+    private func step() {
+        guard var s = scroll else { return }
+        var out = ""
+        var i = s.offset
+        for _ in 0 ..< s.win {
+            out.append(s.chars[i % s.chars.count])
+            i += 1
+        }
+        let target = MenuMetrics.width(s.fitted)
+        var pad = 0
+        while MenuMetrics.width(out) + 7 < target, pad < 24 {
+            out += " "
+            pad += 1
+        }
+        if out != s.shown {
+            s.item.title = out
+            s.shown = out
+        }
+        s.offset += 1
+        scroll = s
+    }
+
+    /// 被省略的标题 → 完整文本（键是菜单里实际显示的省略版）
+    static func fullTexts() -> [String: String] {
+        var map: [String: String] = [:]
+        func put(_ s: String) {
+            let f = MenuMetrics.fit(s)
+            if f != s { map[f] = s }
+        }
+        let st = AppState.shared
+        put("Canvas 课业同步 · \(st.lastSyncText)")
+        put("⏰ 暂无近期待办")
+        put("⏰ 最近 DDL（点开可标记已提交）")
+        for e in st.upcomingSoon.prefix(5) {
+            let s = "📅  " + st.ddlText(for: e)
+            let f = MenuMetrics.fitHead(s)
+            if f != s { map[f] = s }
+        }
+        put("➕ 添加 Deadline…（选课程与日期）")
+        put("↩️ 恢复已忽略的 DDL（\(st.ddlDone.count)）")
+        put("✅ 新内容全部标为已读（\(st.newTotal)）")
+        put("📏 跳过 ≥\(bigFileLimitMB)MB 文件（保留在线链接）")
+        put("⚙️ 设置 Canvas 域名…（\(Cfg.host)）")
+        func walk(_ nodes: [MenuNode], _ cid: Int64) {
+            for n in nodes {
+                if n.isDir {
+                    put(MenuMetrics.folderLabel(n.name))
+                    walk(n.children, cid)
+                } else {
+                    put(MenuMetrics.fileLabel(cid, n.name))
+                }
+            }
+        }
+        for c in st.courses {
+            put(courseMenuLabel(c))
+            for l in st.linksFor(c.id) { put("🔗 \(l.title)") }
+            walk(st.menuNodes(for: c), c.id)
+        }
+        return map
+    }
+}
+
+/// 课程行标题（根菜单与省略映射共用，避免两处各写一份）
+@MainActor
+func courseMenuLabel(_ c: CachedCourse) -> String {
+    let st = AppState.shared
+    let n = st.newFiles[c.id]?.count ?? 0
+    let off = st.syncDisabled.contains(c.id) ? "　⏸" : ""
+    return n > 0 ? "📚  \(c.name)　🆕 \(n)\(off)" : "📚  \(c.name)\(off)"
+}
+
 struct MenuContent: View {
     @ObservedObject var state = AppState.shared
 
     var body: some View {
-        Text("Canvas 课业同步 · \(state.lastSyncText)")
+        Text(MenuMetrics.fit("Canvas 课业同步 · \(state.lastSyncText)"))
             .onAppear { Task { await state.refreshLibrary() } }
 
         Divider()
 
         if state.upcomingSoon.isEmpty {
-            Text("⏰ 暂无近期待办")
+            Text(MenuMetrics.fit("⏰ 暂无近期待办"))
         } else {
-            Text("⏰ 最近 DDL（点开可标记已提交）")
+            Text(MenuMetrics.fit("⏰ 最近 DDL（点开可标记已提交）"))
             ForEach(Array(state.upcomingSoon.prefix(5))) { e in
-                Menu("📅  " + state.ddlText(for: e)) {
+                Menu(MenuMetrics.fitHead("📅  " + state.ddlText(for: e))) {
                     if let s = e.url, !s.isEmpty, let u = URL(string: s) {
                         Button(MenuMetrics.fit("🌐 在 Canvas 打开")) { NSWorkspace.shared.open(u) }
                     }
@@ -2719,15 +2896,15 @@ struct MenuContent: View {
                 }
             }
         }
-        Button("➕ 添加 Deadline…（选课程与日期）") { DdlUI.promptAdd() }
+        Button(MenuMetrics.fit("➕ 添加 Deadline…（选课程与日期）")) { DdlUI.promptAdd() }
         if !state.ddlDone.isEmpty {
-            Button("↩️ 恢复已忽略的 DDL（\(state.ddlDone.count)）") { state.restoreDdlDone() }
+            Button(MenuMetrics.fit("↩️ 恢复已忽略的 DDL（\(state.ddlDone.count)）")) { state.restoreDdlDone() }
         }
 
         Divider()
 
         ForEach(state.courses) { c in
-            Menu(courseLabel(c)) {
+            Menu(MenuMetrics.fit(courseMenuLabel(c))) {
                 Button(MenuMetrics.fit("🌐 在 Canvas 打开课程")) {
                     openOnCanvas(c)
                 }
@@ -2775,17 +2952,17 @@ struct MenuContent: View {
         }
 
         if state.newTotal > 0 {
-            Button("✅ 新内容全部标为已读（\(state.newTotal)）") { state.clearAllNew() }
+            Button(MenuMetrics.fit("✅ 新内容全部标为已读（\(state.newTotal)）")) { state.clearAllNew() }
         }
 
         Divider()
 
-        Button(state.isSyncing ? "⏳ 同步中…" : "🔄 立即同步") {
+        Button(MenuMetrics.fit(state.isSyncing ? "⏳ 同步中…" : "🔄 立即同步")) {
             Task { await SyncEngine.shared.syncAll() }
         }
         .disabled(state.isSyncing)
 
-        Menu("☑️ 同步范围（按课程勾选）") {
+        Menu(MenuMetrics.fit("☑️ 同步范围（按课程勾选）")) {
             ForEach(state.courses) { c in
                 Toggle(MenuMetrics.fit(c.name), isOn: Binding(
                     get: { !state.syncDisabled.contains(c.id) },
@@ -2793,24 +2970,24 @@ struct MenuContent: View {
             }
         }
 
-        Toggle("🎬 跳过视频（保留在线链接）", isOn: Binding(
+        Toggle(MenuMetrics.fit("🎬 跳过视频（保留在线链接）"), isOn: Binding(
             get: { state.skipVideos },
             set: { state.setSkipVideos($0) }))
-        Toggle("📏 跳过 ≥\(bigFileLimitMB)MB 文件（保留在线链接）", isOn: Binding(
+        Toggle(MenuMetrics.fit("📏 跳过 ≥\(bigFileLimitMB)MB 文件（保留在线链接）"), isOn: Binding(
             get: { state.skipBig },
             set: { state.setSkipBig($0) }))
 
         Divider()
 
-        Button("🔑 登录 Canvas…") { SyncEngine.shared.showLogin() }
-        Button("🔑 设置 Canvas 登录账号…") { LoginVaultUI.promptSave() }
-        Button("📂 打开同步库（Canvas 同步）") { openFolder(syncRoot) }
-        Button("⚙️ 设置 Canvas 域名…（\(Cfg.host)）") { ConfigUI.promptOrigin() }
-        Button("📄 查看日志") { NSWorkspace.shared.open(logURL) }
+        Button(MenuMetrics.fit("🔑 登录 Canvas…")) { SyncEngine.shared.showLogin() }
+        Button(MenuMetrics.fit("🔑 设置 Canvas 登录账号…")) { LoginVaultUI.promptSave() }
+        Button(MenuMetrics.fit("📂 打开同步库（Canvas 同步）")) { openFolder(syncRoot) }
+        Button(MenuMetrics.fit("⚙️ 设置 Canvas 域名…（\(Cfg.host)）")) { ConfigUI.promptOrigin() }
+        Button(MenuMetrics.fit("📄 查看日志")) { NSWorkspace.shared.open(logURL) }
         let updBusy = ["正在检查更新", "正在下载", "下载完成", "更新包就绪"].contains { state.progress.hasPrefix($0) }
-        Button(updBusy ? "⏳ 更新进行中…" : "⬆️ 检查更新…") { Updater.checkFromMenu() }
+        Button(MenuMetrics.fit(updBusy ? "⏳ 更新进行中…" : "⬆️ 检查更新…")) { Updater.checkFromMenu() }
 
-        Toggle("🚀 开机自动启动", isOn: Binding(
+        Toggle(MenuMetrics.fit("🚀 开机自动启动"), isOn: Binding(
             get: { state.autoStartOn },
             set: { v in
                 state.autoStartOn = v
@@ -2819,19 +2996,15 @@ struct MenuContent: View {
 
         if !state.progress.isEmpty {
             Divider()
-            Text(state.progress)
+            Text(MenuMetrics.fit(state.progress))
         }
 
         Divider()
 
-        Button("退出 CanvasBar") { NSApp.terminate(nil) }
+        Button(MenuMetrics.fit("退出 CanvasBar")) { NSApp.terminate(nil) }
     }
 
-    func courseLabel(_ c: CachedCourse) -> String {
-        let n = state.newFiles[c.id]?.count ?? 0
-        let off = state.syncDisabled.contains(c.id) ? "　⏸" : ""
-        return n > 0 ? "📚  \(c.name)　🆕 \(n)\(off)" : "📚  \(c.name)\(off)"
-    }
+    func courseLabel(_ c: CachedCourse) -> String { courseMenuLabel(c) }
 
     func openFolder(_ url: URL) {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
