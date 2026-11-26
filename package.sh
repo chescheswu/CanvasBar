@@ -6,7 +6,7 @@ set -e
 cd "$(dirname "$0")"
 
 APP=CanvasBar
-VERSION=2.14.1
+VERSION=$(tr -d '[:space:]' < VERSION 2>/dev/null || echo 2.15.0)
 DEPLOY=13.0   # 最低支持 macOS 13
 DIST="$PWD/dist"
 NAME="$APP-$VERSION"
@@ -58,7 +58,7 @@ codesign --verify --deep --strict "$STAGE/$APP.app"
 echo "▸ 签名校验通过"
 
 # 源码随包（便于在目标机重新编译）
-cp CanvasBar.swift build.sh package.sh AppIcon.icns "$STAGE/source/"
+cp CanvasBar.swift VERSION build.sh package.sh make_dmg.sh AppIcon.icns "$STAGE/source/"
 mkdir -p "$STAGE/source/Assets"
 cp Assets/* "$STAGE/source/Assets/" 2>/dev/null || true
 

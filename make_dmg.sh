@@ -5,7 +5,7 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION=${1:-2.14.1}
+VERSION=${1:-$(tr -d '[:space:]' < VERSION 2>/dev/null || echo 2.15.0)}
 APP=CanvasBar
 STAGE="$PWD/.build/stage-$APP-$VERSION"
 DMG="$PWD/dist/$APP-$VERSION.dmg"

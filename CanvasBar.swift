@@ -8,7 +8,6 @@
 // 运行时配置：~/Library/Application Support/CanvasBar/config.json（Canvas 域名，便于分发他机使用）
 import AppKit
 import Combine
-import SwiftUI
 import WebKit
 import ServiceManagement
 import UniformTypeIdentifiers
@@ -25,20 +24,47 @@ let supportDir = FileManager.default.urls(for: .applicationSupportDirectory, in:
 
 let logURL = supportDir.appendingPathComponent("log.txt")
 
-// MARK: - 运行时配置（config.json 可改 Canvas 域名；换学校/换机器只动这里）
+// MARK: - 运行时配置（config.json 可改 Canvas 域名、同步频率、课程短名；换学校/换机器只动这里）
 
 enum Cfg {
     static let defaultOrigin = "https://canvas.polyu.edu.hk"
-    static private(set) var origin = defaultOrigin
-    static private(set) var host: String = URL(string: defaultOrigin)?.host ?? ""
+    static let defaultSyncIntervalMinutes = 120
+    static let syncIntervalPresets: [(minutes: Int, label: String)] = [
+        (30, "每 30 分钟"),
+        (120, "每 2 小时（默认）"),
+        (360, "每 6 小时"),
+        (1200, "每天一次（20 小时）"),
+    ]
+
+    private static let lock = NSLock()
+    private static var _origin = defaultOrigin
+    private static var _host: String = URL(string: defaultOrigin)?.host ?? ""
+    private static var _syncIntervalMinutes = defaultSyncIntervalMinutes
+    private static var _displayOverrides: [Int64: String] = [:]
+
+    static var origin: String { lock.lock(); defer { lock.unlock() }; return _origin }
+    static var host: String { lock.lock(); defer { lock.unlock() }; return _host }
+    static var syncIntervalMinutes: Int { lock.lock(); defer { lock.unlock() }; return _syncIntervalMinutes }
 
     static var configURL: URL { supportDir.appendingPathComponent("config.json") }
 
     static func load() {
         guard let data = try? Data(contentsOf: configURL),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let o = obj["canvasOrigin"] as? String else { return }
-        apply(o)
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if let o = obj["canvasOrigin"] as? String { apply(o) }
+        if let mins = (obj["syncIntervalMinutes"] as? NSNumber)?.intValue {
+            let clamped = max(15, mins)
+            lock.lock(); _syncIntervalMinutes = clamped; lock.unlock()
+        }
+        if let rawOverrides = obj["displayOverrides"] as? [String: String] {
+            var parsed: [Int64: String] = [:]
+            for (k, v) in rawOverrides {
+                if let cid = Int64(k), !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    parsed[cid] = v
+                }
+            }
+            lock.lock(); _displayOverrides = parsed; lock.unlock()
+        }
     }
 
     static func apply(_ raw: String) {
@@ -47,45 +73,158 @@ enum Cfg {
         if !s.lowercased().hasPrefix("http") { s = "https://" + s }
         while s.hasSuffix("/") { s.removeLast() }
         guard let h = URL(string: s)?.host, !h.isEmpty else { return }
-        origin = s
-        host = h
+        lock.lock()
+        _origin = s
+        _host = h
+        lock.unlock()
     }
 
-    static func save(origin raw: String) {
-        apply(raw)
-        let obj: [String: String] = ["canvasOrigin": origin]
+    static func save() {
+        lock.lock()
+        let curOrigin = _origin
+        let curInterval = _syncIntervalMinutes
+        let curOverrides = _displayOverrides
+        lock.unlock()
+
+        var obj: [String: Any] = [
+            "canvasOrigin": curOrigin,
+            "syncIntervalMinutes": curInterval,
+        ]
+        if !curOverrides.isEmpty {
+            obj["displayOverrides"] = Dictionary(uniqueKeysWithValues: curOverrides.map { (String($0.key), $0.value) })
+        }
         if let d = try? JSONSerialization.data(withJSONObject: obj,
                                                options: [.prettyPrinted, .sortedKeys]) {
             try? d.write(to: configURL, options: .atomic)
         }
     }
+
+    static func save(origin raw: String) {
+        apply(raw)
+        save()
+    }
+
+    static func save(syncIntervalMinutes mins: Int) {
+        let clamped = max(15, mins)
+        lock.lock(); _syncIntervalMinutes = clamped; lock.unlock()
+        save()
+    }
+
+    static func displayOverride(for courseId: Int64) -> String? {
+        lock.lock()
+        let custom = _displayOverrides[courseId]
+        let curOrigin = _origin
+        lock.unlock()
+        if let custom { return custom }
+        if curOrigin == defaultOrigin { return defaultPolyUOverrides[courseId] }
+        return nil
+    }
+
+    /// 提取可注册父域名（用于跨子域 SSO/会话 cookie 持久化，如 canvas.polyu.edu.hk -> polyu.edu.hk）
+    static func cookieRootDomain() -> String {
+        let h = host.lowercased()
+        let parts = h.split(separator: ".").map(String.init)
+        guard parts.count >= 2 else { return h }
+        let suffix2 = parts.suffix(2).joined(separator: ".")
+        let threePartSuffixes: Set<String> = ["edu.hk", "ac.uk", "edu.cn", "edu.au", "co.uk", "edu.tw", "edu.sg"]
+        if parts.count >= 3 && threePartSuffixes.contains(suffix2) {
+            return parts.suffix(3).joined(separator: ".")
+        }
+        return suffix2
+    }
 }
 
-func log(_ s: String) {
-    try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
+private let logQueue = DispatchQueue(label: "local.chester.canvasbar.log")
+private let logDateFormatter: DateFormatter = {
     let f = DateFormatter()
     f.dateFormat = "MM-dd HH:mm:ss"
-    let line = "[\(f.string(from: Date()))] \(s)\n"
-    if let h = try? FileHandle(forWritingTo: logURL) {
-        h.seekToEndOfFile()
-        h.write(line.data(using: .utf8) ?? Data())
-        try? h.close()
-    } else {
-        try? line.data(using: .utf8)?.write(to: logURL)
+    return f
+}()
+
+func log(_ s: String) {
+    logQueue.sync {
+        try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
+        let line = "[\(logDateFormatter.string(from: Date()))] \(s)\n"
+        if let h = try? FileHandle(forWritingTo: logURL) {
+            h.seekToEndOfFile()
+            h.write(line.data(using: .utf8) ?? Data())
+            try? h.close()
+        } else {
+            try? line.data(using: .utf8)?.write(to: logURL)
+        }
     }
 }
 
 /// 日志裁剪：超过 512KB 时只保留尾部 128KB（防无限增长）
 func trimLogIfNeeded() {
-    guard let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
-          let size = attrs[.size] as? NSNumber, size.intValue > 512 * 1024,
-          let data = try? Data(contentsOf: logURL) else { return }
-    let tailTarget = 128 * 1024
-    guard data.count > tailTarget else { return }
-    let cut = data.suffix(tailTarget)
-    if let nl = cut.firstIndex(of: 0x0A) {
-        let trimmed = cut.suffix(from: cut.index(after: nl))
-        try? trimmed.write(to: logURL)
+    logQueue.sync {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
+              let size = attrs[.size] as? NSNumber, size.intValue > 512 * 1024,
+              let data = try? Data(contentsOf: logURL) else { return }
+        let tailTarget = 128 * 1024
+        guard data.count > tailTarget else { return }
+        let cut = data.suffix(tailTarget)
+        if let nl = cut.firstIndex(of: 0x0A) {
+            let trimmed = cut.suffix(from: cut.index(after: nl))
+            try? trimmed.write(to: logURL)
+        }
+    }
+}
+
+/// 弹窗并强制置顶（LSUIElement / 无 Dock 模式下确保可见与键盘焦点）
+@MainActor
+@discardableResult
+func showTopAlert(_ a: NSAlert) -> NSApplication.ModalResponse {
+    a.window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    a.window.level = .modalPanel
+    NSApp.activate(ignoringOtherApps: true)
+    a.window.orderFrontRegardless()
+    a.window.makeKeyAndOrderFront(nil)
+    return a.runModal()
+}
+
+/// 线程安全共享日期格式化器（避免每次渲染/日志重复构造）
+enum DateFmt {
+    private static let lock = NSLock()
+    private static let isoFrac: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+    private static let mmddHHmm: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm"
+        return f
+    }()
+    private static let mmdd: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd"
+        return f
+    }()
+
+    static func parseISO(_ s: String) -> Date? {
+        lock.lock(); defer { lock.unlock() }
+        return isoFrac.date(from: s) ?? isoPlain.date(from: s)
+    }
+
+    static func formatISO(_ d: Date) -> String {
+        lock.lock(); defer { lock.unlock() }
+        return isoPlain.string(from: d)
+    }
+
+    static func formatFullDue(_ d: Date) -> String {
+        lock.lock(); defer { lock.unlock() }
+        return mmddHHmm.string(from: d)
+    }
+
+    static func formatShortDue(_ d: Date) -> String {
+        lock.lock(); defer { lock.unlock() }
+        return mmdd.string(from: d)
     }
 }
 
@@ -113,8 +252,8 @@ func ddlFallbackURL(_ e: UpcomingEvent) -> String? {
     }
 }
 
-// 课程 id → 菜单显示名（简短、Title Case；仅本机显示优化，缺失时自动生成，不影响跨机一致性）
-let displayOverrides: [Int64: String] = [
+// PolyU 默认课程短名回退（可在 config.json 的 displayOverrides 中覆盖或补充）
+let defaultPolyUOverrides: [Int64: String] = [
     6306: "Artificial Intelligence Concepts",
     3689: "Computer Programming in L&C",
     3691: "Digital Studies of Chinese Culture",
@@ -184,10 +323,24 @@ struct SkippedFile: Error {
     let size: Int64
 }
 
-/// 结果盒子：后台线程写、主线程读（只做简单的 done 标记同步）
+/// 结果盒子：后台线程写、主线程读（NSLock 保证跨线程内存可见性）
 final class Box<T>: @unchecked Sendable {
-    var value: T?
-    var done = false
+    private let lock = NSLock()
+    private var _value: T?
+    private var _done = false
+
+    func finish(_ v: T) {
+        lock.lock()
+        _value = v
+        _done = true
+        lock.unlock()
+    }
+
+    func read() -> (done: Bool, value: T?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (_done, _value)
+    }
 }
 
 /// 同步库实时扫描出的一个文件（相对课程文件夹的子目录路径 + 文件名 + 绝对路径）
@@ -197,14 +350,14 @@ struct LibEntry {
     let path: String
 }
 
-/// 课程子菜单的树节点：目录（path=nil）或文件
+/// 课程子菜单的树节点：目录或文件（显式 isDir，目录也保留真实磁盘路径）
 struct MenuNode: Identifiable {
     let id: String
     let name: String
-    let path: String?       // 文件路径；目录为 nil
+    let path: String?
     let fid: String?        // manifest 文件 id（可能为 nil）
+    let isDir: Bool
     let children: [MenuNode]
-    var isDir: Bool { path == nil }
 }
 
 // MARK: - 数据
@@ -259,11 +412,7 @@ struct UpcomingEvent: Codable, Identifiable, Hashable {
     }
 
     var dueDate: Date? {
-        let f1 = ISO8601DateFormatter()
-        f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f1.date(from: due) { return d }
-        let f2 = ISO8601DateFormatter()
-        return f2.date(from: due)
+        DateFmt.parseISO(due)
     }
 
     var daysLeft: Int? {
@@ -276,17 +425,13 @@ struct UpcomingEvent: Codable, Identifiable, Hashable {
 
     var dueText: String {
         guard let d = dueDate else { return due }
-        let f = DateFormatter()
-        f.dateFormat = "MM-dd HH:mm"
-        return f.string(from: d)
+        return DateFmt.formatFullDue(d)
     }
 
     /// 只到日（一级菜单用；时间放到下级菜单的完整标题里）
     var shortDueText: String {
         guard let d = dueDate else { return due }
-        let f = DateFormatter()
-        f.dateFormat = "MM-dd"
-        return f.string(from: d)
+        return DateFmt.formatShortDue(d)
     }
 }
 
@@ -314,20 +459,15 @@ enum AutoStart {
     }
 
     static var isEnabled: Bool {
-        if SMAppService.mainApp.status == .enabled { return true }
-        return FileManager.default.fileExists(atPath: agentPlist.path)
+        if FileManager.default.fileExists(atPath: agentPlist.path) { return true }
+        return SMAppService.mainApp.status == .enabled
     }
 
     static func set(_ on: Bool) {
         if on {
-            do {
-                try SMAppService.mainApp.register()
-                log("开机自启：SMAppService 注册成功")
-                try? FileManager.default.removeItem(at: agentPlist)
-                return
-            } catch {
-                log("SMAppService 注册失败（\(error.localizedDescription)），改用 LaunchAgent")
-            }
+            // ad-hoc 签名每次更新/重编译都会改变 CDHash，SMAppService 极易失效；
+            // 统一使用 LaunchAgent plist（Aqua 会话）确保自启稳定，并清理旧 SMAppService 避免双启
+            try? SMAppService.mainApp.unregister()
             writeAgent()
         } else {
             try? SMAppService.mainApp.unregister()
@@ -336,23 +476,35 @@ enum AutoStart {
         }
     }
 
+    /// 若已启用 LaunchAgent，启动时校准可执行路径（仅当当前运行在标准安装目录时）
+    static func syncPathIfEnabled() {
+        guard FileManager.default.fileExists(atPath: agentPlist.path) else { return }
+        let bundlePath = Bundle.main.bundlePath
+        let stdPrefixes = ["/Applications/", FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path + "/"]
+        guard stdPrefixes.contains(where: { bundlePath.hasPrefix($0) }) else { return }
+        let expectedBin = bundlePath + "/Contents/MacOS/CanvasBar"
+        if let dict = NSDictionary(contentsOf: agentPlist) as? [String: Any],
+           let args = dict["ProgramArguments"] as? [String],
+           args.first == expectedBin {
+            return
+        }
+        writeAgent()
+    }
+
     static func writeAgent() {
         let bin = Bundle.main.bundlePath + "/Contents/MacOS/CanvasBar"
-        let plist = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>Label</key><string>local.chester.canvasbar</string>
-            <key>ProgramArguments</key><array><string>\(bin)</string></array>
-            <key>RunAtLoad</key><true/>
-        </dict>
-        </plist>
-        """
+        let plistObj: [String: Any] = [
+            "Label": "local.chester.canvasbar",
+            "ProgramArguments": [bin],
+            "RunAtLoad": true,
+            "LimitLoadToSessionType": "Aqua",
+            "ProcessType": "Interactive",
+        ]
         try? FileManager.default.createDirectory(at: agentPlist.deletingLastPathComponent(),
                                                  withIntermediateDirectories: true)
         do {
-            try plist.write(to: agentPlist, atomically: true, encoding: .utf8)
+            let data = try PropertyListSerialization.data(fromPropertyList: plistObj, format: .xml, options: 0)
+            try data.write(to: agentPlist, options: .atomic)
             log("开机自启：LaunchAgent 已写入 \(agentPlist.path)")
         } catch {
             log("LaunchAgent 写入失败: \(error.localizedDescription)")
@@ -381,7 +533,9 @@ final class AppState: ObservableObject {
     @Published var links: LinkMap = [:]       // 课程子菜单外部链接（Google Drive 等）
     @Published var libTree: [Int64: [LibEntry]] = [:]   // 课程文件夹实时结构（含用户整理出的子文件夹）
     private var libRefreshInFlight = false
-    private var libLastRefresh: Date?
+    private(set) var libLastRefresh: Date?
+    private var libCourseRefreshedAt: [Int64: Date] = [:]
+    private var libCourseInFlight: Set<Int64> = []
 
     init() {
         loadCache()
@@ -412,9 +566,7 @@ final class AppState: ObservableObject {
 
     var lastSyncText: String {
         guard let d = lastSync else { return "尚未同步" }
-        let f = DateFormatter()
-        f.dateFormat = "MM-dd HH:mm"
-        return "上次同步 " + f.string(from: d)
+        return "上次同步 " + DateFmt.formatFullDue(d)
     }
 
     /// 手动 DDL 转成事件（与 Canvas DDL 统一排序 / 提醒）
@@ -537,15 +689,15 @@ final class AppState: ObservableObject {
     /// 课程子菜单数据（优先磁盘实时结构 → 目录树；尚未扫描到则回退 manifest 平铺）
     func menuNodes(for c: CachedCourse) -> [MenuNode] {
         if let entries = libTree[c.id] {
-            return Self.buildTree(entries)
+            return Self.buildTree(entries, courseRoot: c.url)
         }
         return menuFiles(for: c.id).map {
-            MenuNode(id: "f:" + $0.fid, name: $0.name, path: $0.path, fid: $0.fid, children: [])
+            MenuNode(id: "f:" + $0.fid, name: $0.name, path: $0.path, fid: $0.fid, isDir: false, children: [])
         }
     }
 
-    /// 平铺清单 → 目录树（目录优先、自然排序）
-    static func buildTree(_ entries: [LibEntry]) -> [MenuNode] {
+    /// 平铺清单 → 目录树（目录优先、自然排序；目录保留真实磁盘路径）
+    static func buildTree(_ entries: [LibEntry], courseRoot: URL) -> [MenuNode] {
         final class Dir {
             var files: [(name: String, path: String)] = []
             var subs: [String: Dir] = [:]
@@ -562,13 +714,14 @@ final class AppState: ObservableObject {
             var dirsOut: [MenuNode] = []
             for (name, sub) in d.subs {
                 let p = prefix + [name]
-                dirsOut.append(MenuNode(id: "d:" + p.joined(separator: "/"), name: name, path: nil,
-                                        fid: nil, children: build(sub, p)))
+                let dirURL = p.reduce(courseRoot) { $0.appendingPathComponent($1, isDirectory: true) }
+                dirsOut.append(MenuNode(id: "d:" + p.joined(separator: "/"), name: name,
+                                        path: dirURL.path, fid: nil, isDir: true, children: build(sub, p)))
             }
             dirsOut.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             var filesOut: [MenuNode] = d.files.map {
                 MenuNode(id: "f:" + (prefix + [$0.name]).joined(separator: "/"),
-                         name: $0.name, path: $0.path, fid: nil, children: [])
+                         name: $0.name, path: $0.path, fid: nil, isDir: false, children: [])
             }
             filesOut.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             return dirsOut + filesOut
@@ -576,19 +729,42 @@ final class AppState: ObservableObject {
         return build(root, [])
     }
 
+    /// 扫描跳过的常见开发/依赖/构建目录，避免课程目录下的代码项目把扫描器拖慢或撑爆上限
+    nonisolated static let ignoredScanDirNames: Set<String> = [
+        "node_modules", ".venv", "venv", "__pycache__", ".git", ".hg", ".svn",
+        "dist", "build", ".build", ".next", ".nuxt", "target", "Pods",
+        "DerivedData", ".cache", ".pytest_cache", ".mypy_cache", ".tox",
+        ".ipynb_checkpoints", "site-packages", "vendor",
+    ]
+    nonisolated static let ignoredScanBundleExts: Set<String> = [
+        "app", "xcodeproj", "xcworkspace", "framework", "playground",
+        "photoslibrary", "bundle", "kext",
+    ]
+
+    nonisolated static func shouldSkipScanDirectory(_ url: URL) -> Bool {
+        let name = url.lastPathComponent
+        if ignoredScanDirNames.contains(name) { return true }
+        let ext = url.pathExtension.lowercased()
+        return !ext.isEmpty && ignoredScanBundleExts.contains(ext)
+    }
+
     /// 扫描课程文件夹（同步版本；调用方负责放到后台线程）
     nonisolated static func scanTree(_ root: URL) -> [LibEntry] {
         var out: [LibEntry] = []
         let fm = FileManager.default
-        guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey],
+        guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
                                      options: [.skipsHiddenFiles]) else { return out }
         let rootPath = root.standardizedFileURL.path
         var seen = 0
         for case let u as URL in en {
             seen += 1
             if seen > 30000 || out.count >= 4000 { break }
-            guard let rv = try? u.resourceValues(forKeys: [.isRegularFileKey]),
-                  rv.isRegularFile == true else { continue }
+            guard let rv = try? u.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey]) else { continue }
+            if rv.isDirectory == true {
+                if shouldSkipScanDirectory(u) { en.skipDescendants() }
+                continue
+            }
+            guard rv.isRegularFile == true else { continue }
             if u.lastPathComponent == ".DS_Store" { continue }
             let p = u.standardizedFileURL.path
             guard p.hasPrefix(rootPath + "/") else { continue }
@@ -603,18 +779,30 @@ final class AppState: ObservableObject {
     func scanTreeAsync(_ root: URL, timeout: Double = 8) async -> [LibEntry]? {
         let box = Box<[LibEntry]>()
         DispatchQueue.global(qos: .utility).async {
-            box.value = Self.scanTree(root)
-            box.done = true
+            box.finish(Self.scanTree(root))
         }
         let steps = Int(timeout / 0.4)
         for _ in 0..<steps {
-            if box.done { return box.value ?? [] }
+            let st = box.read()
+            if st.done { return st.value ?? [] }
             try? await Task.sleep(nanoseconds: 400_000_000)
         }
         return nil
     }
 
-    /// 刷新课程文件夹实时结构（菜单打开 / 同步完成后调用；1.5 秒防抖）
+    /// 刷新单门课文件夹实时结构（菜单展开课程时按需触发，30 秒冷却）
+    func refreshCourse(_ course: CachedCourse, force: Bool = false) async {
+        guard !libCourseInFlight.contains(course.id) else { return }
+        if !force, let last = libCourseRefreshedAt[course.id], Date().timeIntervalSince(last) < 30 { return }
+        libCourseInFlight.insert(course.id)
+        defer { libCourseInFlight.remove(course.id) }
+        if let entries = await scanTreeAsync(course.url) {
+            libTree[course.id] = entries
+            libCourseRefreshedAt[course.id] = Date()
+        }
+    }
+
+    /// 刷新全部课程文件夹实时结构（启动 / 同步完成后调用；1.5 秒防抖）
     func refreshLibrary(force: Bool = false) async {
         if libRefreshInFlight { return }
         if !force, let last = libLastRefresh, Date().timeIntervalSince(last) < 1.5 { return }
@@ -623,9 +811,11 @@ final class AppState: ObservableObject {
         defer { libRefreshInFlight = false }
         let snapshot = courses.map { ($0.id, $0.url) }
         var total = 0
+        let now = Date()
         for (id, url) in snapshot {
             if let entries = await scanTreeAsync(url) {
                 libTree[id] = entries
+                libCourseRefreshedAt[id] = now
                 total += entries.count
             }
         }
@@ -653,8 +843,7 @@ final class AppState: ObservableObject {
                 a.messageText = "找不到「\(name)」"
                 a.informativeText = "文件可能已被改名或删除。已为你打开课程文件夹。"
                 a.addButton(withTitle: "好")
-                NSApp.activate(ignoringOtherApps: true)
-                _ = a.runModal()
+                showTopAlert(a)
                 NSWorkspace.shared.open(course.url)
             }
         }
@@ -679,8 +868,7 @@ final class AppState: ObservableObject {
                 a.messageText = "找不到「\(name)」"
                 a.informativeText = "文件可能已被改名或删除。已为你打开课程文件夹。"
                 a.addButton(withTitle: "好")
-                NSApp.activate(ignoringOtherApps: true)
-                _ = a.runModal()
+                showTopAlert(a)
                 NSWorkspace.shared.open(course.url)
             }
         }
@@ -734,22 +922,18 @@ final class AppState: ObservableObject {
 
     /// 宽松解析：ISO8601 或 "yyyy-MM-dd HH:mm" / "yyyy-MM-dd"（本地时区）
     static func normalizedISO(_ s: String) -> String? {
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime]
-        if let d = iso.date(from: s) { return iso.string(from: d) }
+        if let d = DateFmt.parseISO(s) { return DateFmt.formatISO(d) }
         let df = DateFormatter()
         df.locale = Locale(identifier: "en_US_POSIX")
         for fmt in ["yyyy-MM-dd HH:mm", "yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd"] {
             df.dateFormat = fmt
-            if let d = df.date(from: s) { return iso.string(from: d) }
+            if let d = df.date(from: s) { return DateFmt.formatISO(d) }
         }
         return nil
     }
 
     func addManualDdl(title: String, courseId: Int64, date: Date) {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        addManualDdl(title: title, courseId: courseId, dueISO: f.string(from: date))
+        addManualDdl(title: title, courseId: courseId, dueISO: DateFmt.formatISO(date))
     }
 
     func addManualDdl(title: String, courseId: Int64, dueISO raw: String) {
@@ -842,6 +1026,15 @@ final class AppState: ObservableObject {
 
 // MARK: - 同步引擎
 
+private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
 @MainActor
 final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
     static let shared = SyncEngine()
@@ -861,6 +1054,20 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     var loginFinished = false
     var lastNavError: String?
     var lastNavErrorAt: Date?
+    private var activeSessionCheck: Task<Bool, Error>?
+    private var pendingSyncAfterLogin = false
+    private var samlAutoSubmitCount = 0
+    private var lastSamlAutoSubmitURL: String?
+
+    private let noRedirectDelegate = NoRedirectDelegate()
+    private lazy var heartbeatSession: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 15
+        cfg.timeoutIntervalForResource = 30
+        cfg.httpCookieAcceptPolicy = .never
+        cfg.httpShouldSetCookies = false
+        return URLSession(configuration: cfg, delegate: noRedirectDelegate, delegateQueue: nil)
+    }()
 
     // base64 分片回退下载用
     var chunks: [Int64: [Int: String]] = [:]
@@ -920,8 +1127,9 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     }
 
     /// 释放页面、保留壳：Canvas SPA 的 DOM/JS 堆是内存大头，同步完顶成空白页让 WebKit 回收。
-    /// 下次同步 checkSession 慢路会重新 load，登录态在 cookie 里，不受影响。
+    /// 同步或会话检查进行中不得释放，避免互相踩踏。
     func releasePage() {
+        guard !state.isSyncing, activeSessionCheck == nil else { return }
         guard let wv = webView, wv.url?.absoluteString != "about:blank" else { return }
         wv.stopLoading()
         wv.loadHTMLString("", baseURL: nil)
@@ -1015,6 +1223,8 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         loginWindow = nil
         loginWV = nil
         loginFinished = false
+        samlAutoSubmitCount = 0
+        lastSamlAutoSubmitURL = nil
     }
 
     /// 在指定 WebView 内执行异步 JS（返回字符串结果）
@@ -1061,8 +1271,20 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         }
     }
 
-    /// 会话检查：快路直接验；疑过期则重载并等 SSO 静默重登（ADFS 持久 cookie 尚在时自动回流，无需用户）
+    /// 会话检查（单飞互斥）：快路直接验；疑过期则重载并等 SSO 静默重登（ADFS 持久 cookie 尚在时自动回流，无需用户）
     func checkSession(force: Bool = false) async throws -> Bool {
+        if let existing = activeSessionCheck {
+            return try await existing.value
+        }
+        let task = Task<Bool, Error> { @MainActor in
+            try await self.performCheckSession(force: force)
+        }
+        activeSessionCheck = task
+        defer { activeSessionCheck = nil }
+        return try await task.value
+    }
+
+    private func performCheckSession(force: Bool) async throws -> Bool {
         ensureWebView()
         guard let wv = webView else { throw SyncError.noWebView }
 
@@ -1108,10 +1330,8 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     /// 探测当前页是否是「等人输入」的登录页（含密码框）→ 静默重登流程可提前放弃、改弹登录窗
     func isLoginPageNeedingUser(_ wv: WKWebView) async -> Bool {
         let probe = """
-        (function(){
-            try { return document.querySelector('input[type=password]') ? 'YES' : 'NO'; }
-            catch (e) { return 'NO'; }
-        })()
+        try { return document.querySelector('input[type="password"]') ? 'YES' : 'NO'; }
+        catch (e) { return 'NO'; }
         """
         return ((try? await callJS(probe, on: wv)) == "YES")
     }
@@ -1150,6 +1370,8 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         loginFinished = false
         loginVerifyAt = nil
         loginCookieSig = nil
+        samlAutoSubmitCount = 0
+        lastSamlAutoSubmitURL = nil
         snapshotLoginCookies()
         log("登录窗口已打开")
 
@@ -1241,16 +1463,72 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         }
     }
 
-    /// 心跳保活（每 30 分钟）：轻量请求续期 Canvas 会话；失效时先试静默重登；彻底失败不弹窗
+    /// 原生 URLSession 轻量保活（零 WebKit 页面内存）：携带 Cookie Store 里的会话 cookie 调 /api/v1/users/self，
+    /// 服务端返回 200 即表示 session 真实有效，并将新 Set-Cookie 持久化回 WebKit store。
+    func fetchSelfViaURLSession() async -> Bool {
+        ensureWebView()
+        let store = WKWebsiteDataStore.default().httpCookieStore
+        var cookies: [HTTPCookie] = await withCheckedContinuation { cont in
+            store.getAllCookies { cont.resume(returning: $0) }
+        }
+        if cookies.isEmpty {
+            // 冷启动时 WebKit 网络进程刚拉起，binarycookies 可能尚未载入内存，稍等重试一次
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            cookies = await withCheckedContinuation { cont in
+                store.getAllCookies { cont.resume(returning: $0) }
+            }
+        }
+        guard let apiURL = URL(string: Cfg.origin + "/api/v1/users/self") else { return false }
+        let host = Cfg.host.lowercased()
+        let matching = cookies.filter { c in
+            var d = c.domain.lowercased()
+            while d.hasPrefix(".") { d.removeFirst() }
+            return !d.isEmpty && host.hasSuffix(d)
+        }
+        guard !matching.isEmpty else { return false }
+
+        var req = URLRequest(url: apiURL)
+        req.httpMethod = "GET"
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        for (k, v) in HTTPCookie.requestHeaderFields(with: matching) {
+            req.setValue(v, forHTTPHeaderField: k)
+        }
+
+        do {
+            let (_, resp) = try await heartbeatSession.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return false }
+            let headers = Dictionary(uniqueKeysWithValues: http.allHeaderFields.compactMap { k, v -> (String, String)? in
+                guard let ks = k as? String, let vs = v as? String else { return nil }
+                return (ks, vs)
+            })
+            let newCookies = HTTPCookie.cookies(withResponseHeaderFields: headers, for: apiURL)
+            if !newCookies.isEmpty {
+                let expiry = Date().addingTimeInterval(30 * 24 * 3600)
+                for c in newCookies {
+                    var props = c.properties ?? [:]
+                    props.removeValue(forKey: .discard)
+                    if props[.expires] == nil { props[.expires] = expiry }
+                    let target = HTTPCookie(properties: props) ?? c
+                    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                        store.setCookie(target) { cont.resume() }
+                    }
+                }
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// 心跳保活（每 30 分钟）：优先走原生 URLSession 真实续期 Canvas 会话；失效时再尝试静默重登；彻底失败不弹窗
     func keepAlive() async {
         guard !state.isSyncing, loginWindow == nil else { return }
-        // 页面在同步收尾已被 releasePage 释放 → 先查 cookie，不为一次心跳把整个 Canvas SPA 拉起来
         if webView == nil || webView?.url?.absoluteString == "about:blank" {
-            if await sessionCookieValid() {
-                log("心跳: OK（cookie 有效，页面未加载）")
+            if await fetchSelfViaURLSession() {
+                log("心跳: OK（原生请求续期，页面未加载）")
                 return
             }
-            log("心跳: 无有效会话 cookie，尝试静默重登…")
+            log("心跳: 服务端会话已失效，尝试静默重登…")
             let ok = (try? await checkSession(force: true)) == true
             log("心跳: 静默重登\(ok ? "成功" : "失败（保持现状，下次同步时再试）")")
             releasePage()
@@ -1270,26 +1548,28 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     }
 
     /// Canvas 发的是会话 cookie（无 expiresDate），WebKit 只把它留在内存，app 一退就丢。
-    /// 这里复制一份并补 30 天有效期写回，重启后仍可自动续上。
-    /// 只延长本地保存时间，不延长服务端 session —— 靠 30 分钟心跳滑动续期。
+    /// 这里复制一份并补 30 天有效期写回（保留 HttpOnly / SameSite 等属性），重启后仍可自动续上。
     func persistSessionCookies() {
         let store = WKWebsiteDataStore.default().httpCookieStore
+        let host = Cfg.host.lowercased()
+        let rootDomain = Cfg.cookieRootDomain()
         store.getAllCookies { cookies in
-            let host = Cfg.host.lowercased()
             let expiry = Date().addingTimeInterval(30 * 24 * 3600)
             let targets = cookies.filter { c in
                 guard c.expiresDate == nil else { return false }   // 本来就是持久 cookie
                 var d = c.domain.lowercased()
                 while d.hasPrefix(".") { d.removeFirst() }
-                return !d.isEmpty && (host.hasSuffix(d) || d.hasSuffix("polyu.edu.hk"))
+                return !d.isEmpty && (host.hasSuffix(d) || d == rootDomain || d.hasSuffix("." + rootDomain))
             }
             guard !targets.isEmpty else { return }
             log("cookie 持久化: 处理 \(targets.count) 条会话 cookie → 30 天")
             for c in targets {
-                var props: [HTTPCookiePropertyKey: Any] = [
+                var props = c.properties ?? [
                     .name: c.name, .value: c.value, .domain: c.domain,
-                    .path: c.path.isEmpty ? "/" : c.path, .expires: expiry,
+                    .path: c.path.isEmpty ? "/" : c.path,
                 ]
+                props.removeValue(forKey: .discard)
+                props[.expires] = expiry
                 if c.isSecure { props[.secure] = "TRUE" }
                 guard let m = HTTPCookie(properties: props) else { continue }
                 store.setCookie(m) {}
@@ -1320,35 +1600,43 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         return ok
     }
 
-    /// ADFS/SAML 递交页等待：若 3.5 秒未自动跳转，则协助递交一次（防卡在半路）
+    /// ADFS/SAML 递交页等待：仅在页面无密码框且存在 SAMLResponse/wresult 隐藏域时介入，且同页最多提交一次、全程上限 2 次
     func checkSamlSubmitPage(on wv: WKWebView) {
         let probe = """
         try {
+            if (document.querySelector('input[type="password"]')) return 'LOGIN_FORM';
             var fs = Array.from(document.forms || []);
-            var f = fs.find(function(x){ return (x.querySelector && x.querySelector('input[name="SAMLResponse"]')) ||
-                /saml|canvas/i.test(x.getAttribute('action') || ''); });
+            var f = fs.find(function(x){
+                return !!(x.querySelector && (x.querySelector('input[name="SAMLResponse"]') || x.querySelector('input[name="wresult"]')));
+            });
             return f ? 'YES' : 'NO';
         } catch (e) { return 'NO'; }
         """
         Task { @MainActor in
-            guard self.loginWV === wv, self.loginWindow != nil else { return }
+            guard self.loginWV === wv, self.loginWindow != nil, !self.loginFinished else { return }
+            guard self.samlAutoSubmitCount < 2 else { return }
             guard let r = try? await self.callJS(probe, on: wv), r == "YES" else { return }
             let u0 = wv.url?.absoluteString
+            guard u0 != self.lastSamlAutoSubmitURL else { return }
             log("登录窗：检测到 SAML 递交页，等待自动跳转…")
             try? await Task.sleep(nanoseconds: 3_500_000_000)
-            guard self.loginWV === wv, self.loginWindow != nil,
-                  wv.url?.absoluteString == u0, !wv.isLoading else { return }
+            guard self.loginWV === wv, self.loginWindow != nil, !self.loginFinished,
+                  wv.url?.absoluteString == u0, !wv.isLoading, self.samlAutoSubmitCount < 2 else { return }
             let submit = """
             try {
+                if (document.querySelector('input[type="password"]')) return 'LOGIN_FORM';
                 var fs = Array.from(document.forms || []);
-                var f = fs.find(function(x){ return (x.querySelector && x.querySelector('input[name="SAMLResponse"]')) ||
-                    /saml|canvas/i.test(x.getAttribute('action') || ''); });
+                var f = fs.find(function(x){
+                    return !!(x.querySelector && (x.querySelector('input[name="SAMLResponse"]') || x.querySelector('input[name="wresult"]')));
+                });
                 if (f) { f.submit(); return 'SUBMITTED'; }
                 return 'GONE';
             } catch (e) { return 'ERR:' + e; }
             """
             if let r2 = try? await self.callJS(submit, on: wv), r2 == "SUBMITTED" {
-                log("登录窗：SAML 递交页 3.5 秒未跳转，已协助提交")
+                self.samlAutoSubmitCount += 1
+                self.lastSamlAutoSubmitURL = u0
+                log("登录窗：SAML 递交页 3.5 秒未跳转，已协助提交（第 \(self.samlAutoSubmitCount) 次）")
             }
         }
     }
@@ -1412,7 +1700,7 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
             var p = document.querySelector('input[type="password"]');
             var u = document.querySelector('input[name="UserName"],input[name="username"],input[type="email"]');
             if (p && p.value) {
-                window.webkit.messageHandlers.login.post({kind:'credentials', user: (u && u.value) || '', pass: p.value});
+                window.webkit.messageHandlers.login.postMessage({kind:'credentials', user: (u && u.value) || '', pass: p.value});
             }
         } catch (e) {}
     }, true);
@@ -1494,6 +1782,10 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     func finishLoginSuccess() {
         guard !loginFinished, loginWindow != nil else { return }
         loginFinished = true
+        loginTimer?.invalidate()
+        loginTimer = nil
+        samlAutoSubmitCount = 0
+        lastSamlAutoSubmitURL = nil
         log("登录成功")
         loginWindow?.orderOut(nil)
         loginWindow?.close()
@@ -1507,7 +1799,11 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         pendingLoginUser = nil
         pendingLoginPass = nil
         state.progress = "✅ 登录成功，开始同步…"
-        Task { @MainActor in await self.syncAll() }
+        if state.isSyncing {
+            pendingSyncAfterLogin = true
+        } else {
+            Task { @MainActor in await self.syncAll() }
+        }
     }
 
     // MARK: 同步主流程
@@ -1515,10 +1811,18 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     func syncAll(only: Set<Int64>? = nil) async {
         guard !state.isSyncing else { log("已有同步进行中，跳过"); return }
         state.isSyncing = true
+        var runFollowUp = false
         defer {
             state.isSyncing = false
             state.saveState()
             releasePage()          // 同步收尾即卸载页面，避免 Canvas SPA 常驻
+            if pendingSyncAfterLogin {
+                pendingSyncAfterLogin = false
+                runFollowUp = true
+            }
+            if runFollowUp {
+                Task { @MainActor in await self.syncAll() }
+            }
         }
         log("=== 同步开始 ===\(only == nil ? "" : " 仅课程 \(only!.map(String.init).joined(separator: ","))") 库=\(syncRoot.path)")
         do {
@@ -1561,7 +1865,7 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
                 return f
             }
             for (id, name) in remote {
-                let display = displayOverrides[id] ?? shortName(name)
+                let display = Cfg.displayOverride(for: id) ?? shortName(name)
                 merged.append(CachedCourse(id: id, name: display, folder: uniqueFolder(display)))
             }
             for old in state.courses where !merged.contains(where: { $0.id == old.id }) {
@@ -1595,20 +1899,24 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
                     continue
                 }
                 state.progress = "同步「\(name)」…"
-                let fetched: (files: [RemoteFile], links: [ExternalLink])? =
+                let fetched: (files: [RemoteFile], links: [ExternalLink], allSourcesOK: Bool)? =
                     try? await fetchCourseFiles(courseId: id)
                 let files = fetched?.files ?? []
-                if let ls = fetched?.links { linksMap[String(id)] = ls }
+                if let s = fetched, (s.allSourcesOK || !s.links.isEmpty) {
+                    linksMap[String(id)] = s.links
+                }
                 log("课程 \(id) \(name): 共 \(files.count) 个文件条目，外部链接 \(fetched?.links.count ?? 0) 条")
                 var cm = manifest[String(id)] ?? [:]
-                // 源已成功取到：清理不再出现在源里的记录（菜单保持「源现状」；磁盘文件不动）
-                if let s = fetched {
+                // 仅当三源全部成功且无接口报错时才清理 stale 记录，防止断网/401 误清整个课程 manifest
+                if let s = fetched, s.allSourcesOK {
                     let srcFids = Set(s.files.map { String($0.id) })
                     let stale = cm.keys.filter { !srcFids.contains($0) }
                     if !stale.isEmpty {
                         log("  记录清理: 移除 \(stale.count) 条不再同步的条目")
                         for k in stale { cm.removeValue(forKey: k) }
                     }
+                } else if fetched != nil {
+                    log("  ⚠️ 部分源请求失败，跳过本轮 stale 记录清理")
                 }
                 let syncDir = course.url
                 try? FileManager.default.createDirectory(at: syncDir, withIntermediateDirectories: true)
@@ -1760,12 +2068,12 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     func scanCourseDirAsync(_ root: URL, timeout: Double = 15) async -> [String: [(size: Int64, path: String)]]? {
         let box = Box<[String: [(size: Int64, path: String)]]>()
         DispatchQueue.global(qos: .utility).async {
-            box.value = Self.scanSync(root)
-            box.done = true
+            box.finish(Self.scanSync(root))
         }
         let steps = Int(timeout / 0.5)
         for _ in 0..<steps {
-            if box.done { return box.value ?? [:] }
+            let st = box.read()
+            if st.done { return st.value ?? [:] }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         return nil
@@ -1775,12 +2083,12 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     func shallowListAsync(_ dir: URL, timeout: Double = 8) async -> [String]? {
         let box = Box<[String]>()
         DispatchQueue.global(qos: .utility).async {
-            box.value = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
-            box.done = true
+            box.finish((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
         }
         let steps = Int(timeout / 0.5)
         for _ in 0..<steps {
-            if box.done { return box.value }
+            let st = box.read()
+            if st.done { return st.value }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         return nil
@@ -1790,14 +2098,18 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         var idx: [String: [(size: Int64, path: String)]] = [:]
         let fm = FileManager.default
         guard let en = fm.enumerator(
-            at: root, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            at: root, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey, .isDirectoryKey],
             options: [.skipsHiddenFiles]) else { return idx }
         var seen = 0
         for case let u as URL in en {
             seen += 1
             if seen > 20000 { break }  // 保险丝：超大目录不递归到底
-            guard let rv = try? u.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-                  rv.isRegularFile == true else { continue }
+            guard let rv = try? u.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey]) else { continue }
+            if rv.isDirectory == true {
+                if AppState.shouldSkipScanDirectory(u) { en.skipDescendants() }
+                continue
+            }
+            guard rv.isRegularFile == true else { continue }
             if u.lastPathComponent == ".DS_Store" { continue }
             idx[u.lastPathComponent, default: []].append((Int64(rv.fileSize ?? 0), u.path))
         }
@@ -1840,13 +2152,9 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         let dest = weblocPath(name: name, fileId: fileId, dir: dir)
         guard !FileManager.default.fileExists(atPath: dest.path) else { return dest }
         let link = "\(Cfg.origin)/courses/\(courseId)/files/\(fileId)"
-        let xml = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0"><dict><key>URL</key><string>\(link)</string></dict></plist>
-        """
         do {
-            try xml.write(to: dest, atomically: true, encoding: .utf8)
+            let data = try PropertyListSerialization.data(fromPropertyList: ["URL": link], format: .xml, options: 0)
+            try data.write(to: dest, options: .atomic)
         } catch {
             log("webloc 写入失败 \(dest.lastPathComponent): \(error.localizedDescription)")
         }
@@ -1883,15 +2191,15 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     /// 三源并集：模块文件 ∪ 公告附件 ∪ 页面正文引用（fid 去重，名字尽量取到）
     /// ★ 页面列表接口不含 body，必须逐页取详情（含课程首页 front_page）——有的课材料只在 Pages 里
     /// 顺带收集课程里的外部链接（如 Google Drive 课件夹）→ links.json → 菜单一键打开
-    func fetchCourseFiles(courseId: Int64) async throws -> (files: [RemoteFile], links: [ExternalLink]) {
+    func fetchCourseFiles(courseId: Int64) async throws -> (files: [RemoteFile], links: [ExternalLink], allSourcesOK: Bool) {
         let body = """
         const map = {};
         const add = (fid, name) => {
             const k = String(fid);
-            if (!map[k]) map[k] = name || '';
-            else if (!map[k] && name) map[k] = name;
+            if (!(k in map) || (!map[k] && name)) map[k] = name || '';
         };
         const counts = {mods: 0, anns: 0, pages: 0, bodies: 0, links: 0};
+        const errors = [];
         const links = [];
         const addLink = (url, title) => {
             if (!url) return;
@@ -1931,7 +2239,7 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
                     if (it.type === 'ExternalUrl' && it.external_url) addLink(it.external_url, it.title);
                 }
             }
-        } catch (e) {}
+        } catch (e) { if (!/HTTP 404\\b/.test(String(e))) errors.push('modules:' + String(e)); }
         try {
             const anns = await window.fetchAllPages('/api/v1/courses/\(courseId)/discussion_topics?only_announcements=true&per_page=100');
             counts.anns = anns.length;
@@ -1943,7 +2251,7 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
                 while ((m = re.exec(msg))) add(m[1], '');
                 scanLinks(msg);
             }
-        } catch (e) {}
+        } catch (e) { errors.push('anns:' + String(e)); }
         try {
             const bodies = [];
             const fp = await fetch('/api/v1/courses/\(courseId)/front_page', {credentials: 'include'})
@@ -1964,18 +2272,22 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
                 while ((m = re.exec(b))) add(m[1], '');
                 scanLinks(b);
             }
-        } catch (e) {}
+        } catch (e) { if (!/HTTP 404\\b/.test(String(e))) errors.push('pages:' + String(e)); }
         counts.links = links.length;
-        return JSON.stringify({files: Object.keys(map).map(k => ({id: Number(k), name: map[k] || null})), links: links.slice(0, 20), counts});
+        return JSON.stringify({files: Object.keys(map).map(k => ({id: Number(k), name: map[k] || null})), links: links.slice(0, 20), counts, errors});
         """
         let raw = try await eval(body)
         guard let data = raw.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             log("三源解析失败 course=\(courseId): \(raw.prefix(120))")
-            return ([], [])
+            return ([], [], false)
         }
         if let counts = obj["counts"] as? [String: Any] {
             log("  源统计: modules=\(counts["mods"] ?? 0) anns=\(counts["anns"] ?? 0) pages=\(counts["pages"] ?? 0) bodies=\(counts["bodies"] ?? 0) links=\(counts["links"] ?? 0)")
+        }
+        let errors = (obj["errors"] as? [String]) ?? []
+        if !errors.isEmpty {
+            log("  ⚠️ 源请求异常 course=\(courseId): \(errors.joined(separator: "; "))")
         }
         var files: [RemoteFile] = []
         if let arr = obj["files"], let fd = try? JSONSerialization.data(withJSONObject: arr) {
@@ -1985,7 +2297,7 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
         if let arr = obj["links"], let ld = try? JSONSerialization.data(withJSONObject: arr) {
             extLinks = (try? JSONDecoder().decode([ExternalLink].self, from: ld)) ?? []
         }
-        return (files, extLinks)
+        return (files, extLinks, errors.isEmpty)
     }
 
     func fetchUpcoming() async throws -> [UpcomingEvent] {
@@ -2062,6 +2374,9 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
             if fileName.isEmpty { fileName = pu.name ?? "" }
             if let s = pu.size { knownSize = max(knownSize, s) }
         }
+        if fileName.contains("%"), let decoded = fileName.removingPercentEncoding {
+            fileName = decoded
+        }
         if fileName.isEmpty { fileName = "file-\(fileId)" }
 
         // 兜底过滤：名字/大小只有在解析 public_url 后才拿到的场景
@@ -2107,7 +2422,8 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
     }
 
     func webviewDownload(fileId: Int64) async throws -> Data {
-        try await withCheckedThrowingContinuation { cont in
+        guard let wv = webView else { throw SyncError.noWebView }
+        return try await withCheckedThrowingContinuation { cont in
             pending[fileId] = cont
             let script = """
             void (async () => {
@@ -2129,7 +2445,7 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
                         let bin = '';
                         for (let i = 0; i < u8.length; i += 0x8000)
                             bin += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + 0x8000, u8.length)));
-                        window.webkit.messageHandlers.sync.post({kind: 'chunk', fid: fid, i: seq++, data: btoa(bin)});
+                        window.webkit.messageHandlers.sync.postMessage({kind: 'chunk', fid: fid, i: seq++, data: btoa(bin)});
                     };
                     while (true) {
                         const {done, value} = await reader.read();
@@ -2142,15 +2458,13 @@ final class SyncEngine: NSObject, WKScriptMessageHandler, WKNavigationDelegate, 
                     }
                     if (buf.length) flush(buf);
                     if (seq === 0) flush(new Uint8Array(0));   // 空文件也发一片，保持编号存在
-                    window.webkit.messageHandlers.sync.post({kind: 'done', fid: fid});
+                    window.webkit.messageHandlers.sync.postMessage({kind: 'done', fid: fid});
                 } catch (e) {
-                    window.webkit.messageHandlers.sync.post({kind: 'fail', fid: fid, error: String(e)});
+                    window.webkit.messageHandlers.sync.postMessage({kind: 'fail', fid: fid, error: String(e)});
                 }
             })();
             """
-            if let wv = webView {
-                wv.evaluateJavaScript(script, completionHandler: nil)
-            }
+            wv.evaluateJavaScript(script, completionHandler: nil)
             DispatchQueue.main.asyncAfter(deadline: .now() + 300) { [weak self] in
                 guard let self, self.pending[fileId] != nil else { return }
                 self.pending[fileId] = nil
@@ -2322,6 +2636,7 @@ enum OpenWith {
 
 enum Updater {
     static let repo = "chescheswu/CanvasBar"
+    @MainActor static var isBusy = false
 
     /// 当前版本：优先 Info.plist；环境变量 CANVASBAR_VERSION_OVERRIDE 可覆盖（更新链路实测用）
     static var currentVersion: String {
@@ -2377,12 +2692,7 @@ enum Updater {
     /// 弹窗并强制置顶（LSUIElement / 前台无焦点场景下的可见性保障）
     @MainActor
     static func showAlert(_ a: NSAlert) -> NSApplication.ModalResponse {
-        a.window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        a.window.level = .modalPanel
-        NSApp.activate(ignoringOtherApps: true)
-        a.window.orderFrontRegardless()
-        a.window.makeKeyAndOrderFront(nil)
-        return a.runModal()
+        showTopAlert(a)
     }
 
     static func fetchLatest() async throws -> Release {
@@ -2403,6 +2713,8 @@ enum Updater {
     /// 菜单「⬆️ 检查更新…」入口
     @MainActor
     static func checkFromMenu() {
+        guard !isBusy else { return }
+        isBusy = true
         let state = AppState.shared
         state.progress = "正在检查更新…"
         log("检查更新：用户触发（当前 v\(currentVersion)）")
@@ -2414,6 +2726,7 @@ enum Updater {
                     log("检查更新：远端 \(rel.tag_name) → 有新版本，弹窗提示")
                     promptUpdate(rel)
                 } else {
+                    isBusy = false
                     log("检查更新：远端 \(rel.tag_name) → 已是最新")
                     let a = NSAlert()
                     a.messageText = "已是最新版本（v\(currentVersion)）"
@@ -2425,6 +2738,7 @@ enum Updater {
                     log("检查更新：已是最新提示已关闭")
                 }
             } catch {
+                isBusy = false
                 state.progress = ""
                 log("检查更新失败: \(error.localizedDescription)")
                 let a = NSAlert()
@@ -2457,9 +2771,11 @@ enum Updater {
             log("更新提示：用户选择「一键更新」")
             performUpdate(rel)
         } else if r == .alertSecondButtonReturn {
+            isBusy = false
             log("更新提示：用户选择「查看 Release 页面」")
             if let u = URL(string: rel.html_url) { NSWorkspace.shared.open(u) }
         } else {
+            isBusy = false
             log("更新提示：用户选择「稍后」")
         }
     }
@@ -2467,17 +2783,20 @@ enum Updater {
     /// 一键更新：下载 → 解压校验 → 后台替换脚本 → 退出重启
     @MainActor
     static func performUpdate(_ rel: Release) {
+        isBusy = true
         let state = AppState.shared
         let targetApp = Bundle.main.bundlePath
         let parentDir = (targetApp as NSString).deletingLastPathComponent
         log("一键更新：开始（target=\(targetApp)）")
         guard FileManager.default.isWritableFile(atPath: parentDir) else {
+            isBusy = false
             log("一键更新：中止——目录不可写 \(parentDir)")
             fallbackToReleasePage(rel, why: "当前 App 所在目录不可写（\(parentDir)），无法自动更新。")
             return
         }
         guard let asset = rel.assets.first(where: { $0.name.hasSuffix("universal.zip") })
                 ?? rel.assets.first(where: { $0.name.hasSuffix(".zip") }) else {
+            isBusy = false
             log("一键更新：中止——Release 未附带 zip 资产")
             fallbackToReleasePage(rel, why: "该 Release 未附带 zip 安装包。")
             return
@@ -2492,14 +2811,14 @@ enum Updater {
                 state.progress = "更新包就绪，正在重启替换…"
                 try applyAndRelaunch(stagedApp: staged, targetApp: targetApp, zip: zip)
             } catch {
+                isBusy = false
                 state.progress = ""
                 log("更新失败: \(error.localizedDescription)")
                 let a = NSAlert()
                 a.messageText = "更新失败"
                 a.informativeText = "\(error.localizedDescription)\n已保留当前版本，可稍后重试。"
                 a.addButton(withTitle: "好")
-                NSApp.activate(ignoringOtherApps: true)
-                _ = a.runModal()
+                _ = showAlert(a)
             }
         }
     }
@@ -2575,6 +2894,10 @@ enum Updater {
         return p.terminationStatus
     }
 
+    private static func shQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+
     /// 写替换脚本（等待本进程退出 → 换包 → 重启；失败自动回滚），随后本进程退出
     @MainActor
     static func applyAndRelaunch(stagedApp: URL, targetApp: String, zip: URL) throws {
@@ -2583,27 +2906,34 @@ enum Updater {
         let script = udir.appendingPathComponent("apply_update.sh")
         let oldBackup = udir.appendingPathComponent("CanvasBar-old.app").path
         let logPath = udir.appendingPathComponent("apply.log").path
-        let stageDir = stagedApp.deletingLastPathComponent().deletingLastPathComponent().path
+        let stageDir = udir.appendingPathComponent("stage", isDirectory: true).path
+
+        let qLog = shQuote(logPath)
+        let qOld = shQuote(oldBackup)
+        let qTarget = shQuote(targetApp)
+        let qStaged = shQuote(stagedApp.path)
+        let qStageDir = shQuote(stageDir)
+        let qZip = shQuote(zip.path)
 
         let sh = """
         #!/bin/zsh
-        exec >> "\(logPath)" 2>&1
+        exec >> \(qLog) 2>&1
         echo "[update] $(date '+%F %T') 等待旧实例退出（pid \(pid)）…"
         for i in {1..200}; do /bin/kill -0 \(pid) 2>/dev/null || break; sleep 0.3; done
         sleep 0.5
-        if [ -d "\(oldBackup)" ]; then /usr/bin/trash "\(oldBackup)" >/dev/null 2>&1 || true; fi
-        if /bin/mv "\(targetApp)" "\(oldBackup)"; then
-            if /usr/bin/ditto "\(stagedApp.path)" "\(targetApp)"; then
-                /usr/bin/xattr -dr com.apple.quarantine "\(targetApp)" >/dev/null 2>&1 || true
+        if [ -d \(qOld) ]; then /usr/bin/trash \(qOld) >/dev/null 2>&1 || true; fi
+        if /bin/mv \(qTarget) \(qOld); then
+            if /usr/bin/ditto \(qStaged) \(qTarget); then
+                /usr/bin/xattr -dr com.apple.quarantine \(qTarget) >/dev/null 2>&1 || true
                 echo "[update] 替换完成，重启：\(targetApp)"
-                /usr/bin/open "\(targetApp)"
-                /usr/bin/trash "\(oldBackup)" >/dev/null 2>&1 || true
-                /usr/bin/trash "\(stageDir)" >/dev/null 2>&1 || true
-                /usr/bin/trash "\(zip.path)" >/dev/null 2>&1 || true
+                /usr/bin/open \(qTarget)
+                /usr/bin/trash \(qOld) >/dev/null 2>&1 || true
+                /usr/bin/trash \(qStageDir) >/dev/null 2>&1 || true
+                /usr/bin/trash \(qZip) >/dev/null 2>&1 || true
             else
                 echo "[update] ditto 失败，回滚旧版本"
-                /bin/mv "\(oldBackup)" "\(targetApp)"
-                /usr/bin/open "\(targetApp)"
+                /bin/mv \(qOld) \(qTarget)
+                /usr/bin/open \(qTarget)
             fi
         else
             echo "[update] 无法移动旧 App（\(targetApp)）"
@@ -2770,10 +3100,11 @@ final class MenuController: NSObject {
         si.menu = LazyMenu(title: "CanvasBar") { [weak self] m in self?.fillRoot(m) }
         statusItem = si
         updateLabel()
-        // 只刷新状态栏标签；菜单内容等打开时再生成
-        labelObserver = AppState.shared.objectWillChange
+        // 仅订阅影响 DDL 剩余天数的字段，避免 progress 更新高频重算菜单栏标签
+        let st = AppState.shared
+        labelObserver = Publishers.CombineLatest3(st.$upcoming, st.$manualDdl, st.$ddlDone)
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in MainActor.assumeIsolated { self?.updateLabel() } }
+            .sink { [weak self] _, _, _ in MainActor.assumeIsolated { self?.updateLabel() } }
     }
 
     /// 状态栏标签：最近 DDL 剩余天数
@@ -2884,9 +3215,20 @@ final class MenuController: NSObject {
         m.addItem(action(MenuMetrics.fit("🔑 设置 Canvas 登录账号…")) { LoginVaultUI.promptSave() })
         m.addItem(action(MenuMetrics.fit("📂 打开同步库（Canvas 同步）")) { self.openFolder(syncRoot) })
         m.addItem(action(MenuMetrics.fit("⚙️ 设置 Canvas 域名…（\(Cfg.host)）")) { ConfigUI.promptOrigin() })
+        m.addItem(submenuItem(MenuMetrics.fit("⏱ 自动同步频率")) { m2 in
+            let cur = Cfg.syncIntervalMinutes
+            for preset in Cfg.syncIntervalPresets {
+                m2.addItem(self.check(MenuMetrics.fit(preset.label), on: cur == preset.minutes) {
+                    Cfg.save(syncIntervalMinutes: preset.minutes)
+                    st.progress = "⏱ 同步频率已设为：\(preset.label)"
+                    log("同步频率已改为 \(preset.minutes) 分钟")
+                })
+            }
+        })
         m.addItem(action(MenuMetrics.fit("📄 查看日志")) { NSWorkspace.shared.open(logURL) })
-        let updBusy = ["正在检查更新", "正在下载", "下载完成", "更新包就绪"].contains { st.progress.hasPrefix($0) }
-        m.addItem(action(MenuMetrics.fit(updBusy ? "⏳ 更新进行中…" : "⬆️ 检查更新…")) { Updater.checkFromMenu() })
+        let updItem = action(MenuMetrics.fit(Updater.isBusy ? "⏳ 更新进行中…" : "⬆️ 检查更新…")) { Updater.checkFromMenu() }
+        updItem.isEnabled = !Updater.isBusy
+        m.addItem(updItem)
 
         m.addItem(check(MenuMetrics.fit("🚀 开机自动启动"), on: st.autoStartOn) {
             st.autoStartOn.toggle()
@@ -2924,6 +3266,7 @@ final class MenuController: NSObject {
 
     private func fillCourse(_ m: NSMenu, c: CachedCourse, row: String) {
         let st = AppState.shared
+        Task { await st.refreshCourse(c) }
         if MenuMetrics.truncated(row) {
             header(m, courseHeader(c))
             m.addItem(.separator())
@@ -3038,8 +3381,8 @@ final class MenuController: NSObject {
             }
             m.addItem(action(MenuMetrics.fit("其他…（选择应用）")) { OpenWith.chooseAppAndOpen(fileURL) })
         } else {
-            // 路径失效时仍保留此项：既是提示，也是可以走自愈打开的位置
-            m.addItem(info(MenuMetrics.fit("其他…（选择应用）")))
+            // 路径失效时可点击触发按文件名自愈打开
+            m.addItem(action(MenuMetrics.fit("打开（尝试查找已移动的文件）")) { st.openNode(course, n) })
         }
 
         m.addItem(.separator())
@@ -3055,8 +3398,7 @@ enum CoursesUI {
         a.informativeText = "已同步的文件会原样保留在课程文件夹中（子菜单里仍可打开），但从现在起不再检查、下载该课程的新内容。可随时在子菜单里恢复。"
         a.addButton(withTitle: "关闭同步")
         a.addButton(withTitle: "取消")
-        NSApp.activate(ignoringOtherApps: true)
-        guard a.runModal() == .alertFirstButtonReturn else { return }
+        guard showTopAlert(a) == .alertFirstButtonReturn else { return }
         let st = AppState.shared
         st.setSyncEnabled(c.id, false)
         st.clearNew(c.id)
@@ -3078,8 +3420,7 @@ enum ConfigUI {
         tf.placeholderString = Cfg.defaultOrigin
         alert.accessoryView = tf
         alert.window.initialFirstResponder = tf
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard showTopAlert(alert) == .alertFirstButtonReturn else { return }
         let v = tf.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !v.isEmpty, v != Cfg.origin else { return }
         Cfg.save(origin: v)
@@ -3099,8 +3440,7 @@ enum DdlUI {
             a.messageText = "还没有课程列表"
             a.informativeText = "请先「登录 Canvas」并同步一次，取得课程列表后再手动添加 Deadline。"
             a.addButton(withTitle: "好")
-            NSApp.activate(ignoringOtherApps: true)
-            _ = a.runModal()
+            showTopAlert(a)
             return
         }
 
@@ -3145,8 +3485,7 @@ enum DdlUI {
 
         alert.accessoryView = container
         alert.window.initialFirstResponder = titleField
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard showTopAlert(alert) == .alertFirstButtonReturn else { return }
 
         var title = titleField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if title.isEmpty { title = "未命名 Deadline" }
@@ -3168,15 +3507,17 @@ enum DdlUI {
     }
 }
 
-// MARK: - App 入口
+// MARK: - App 入口（纯 AppKit，零 SwiftUI 壳）
 
 @main
-struct CanvasBarApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
-
-    var body: some Scene {
-        // 菜单栏由 MenuController 用原生 NSStatusItem/NSMenu 搭（按需展开，省内存）
-        Settings { EmptyView() }
+enum CanvasBarMain {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        withExtendedLifetime(delegate) {
+            app.run()
+        }
     }
 }
 
@@ -3257,8 +3598,7 @@ enum SingleVersion {
         a.informativeText = "检测到另外 \(todo.count) 份安装（当前运行 \(me.path) · v\(Updater.currentVersion)）：\n\(list)\n\n移入废纸篓会保留可撤销的副本，不影响当前这份。"
         a.addButton(withTitle: "移入废纸篓")
         a.addButton(withTitle: "保留，不再提示")
-        NSApp.activate(ignoringOtherApps: true)
-        let choice = a.runModal()
+        let choice = showTopAlert(a)
 
         guard choice == .alertFirstButtonReturn else {
             remember(todo.map(\.key))
@@ -3276,6 +3616,7 @@ enum SingleVersion {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var timer: Timer?
 
@@ -3292,9 +3633,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.applicationIconImage = ic
         }
         Cfg.load()
+        AutoStart.syncPathIfEnabled()
+        AppState.shared.autoStartOn = AutoStart.isEnabled
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: syncRoot, withIntermediateDirectories: true)
-        log("CanvasBar v\(Updater.currentVersion) 启动 | canvas=\(Cfg.origin) | 库=\(syncRoot.path) | macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        log("CanvasBar v\(Updater.currentVersion) 启动 | canvas=\(Cfg.origin) | 同步周期=\(Cfg.syncIntervalMinutes)m | 库=\(syncRoot.path) | macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
         SingleVersion.enforce()   // 同一环境只留一份安装（多余副本提示移入废纸篓）
         AppState.shared.reloadManifest()
         let mi = AppState.shared.manifest
@@ -3304,11 +3647,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AppState.shared.consumeAddDdlHook()
             await AppState.shared.refreshLibrary(force: true)
             let engine = SyncEngine.shared
-            // 先看 cookie：有效就不加载整页，避免冷启动即把 Canvas SPA 拉进内存
-            var loggedIn = await engine.sessionCookieValid()
+            // 优先走原生 URLSession 轻量验会话（零 WebKit 页面内存）；失败再走 checkSession 静默重登
+            var loggedIn = await engine.fetchSelfViaURLSession()
             if !loggedIn { loggedIn = (try? await engine.checkSession(force: false)) == true }
             if loggedIn {
-                let due = AppState.shared.lastSync.map { Date().timeIntervalSince($0) > 20 * 3600 } ?? true
+                let interval = TimeInterval(Cfg.syncIntervalMinutes * 60)
+                let due = AppState.shared.lastSync.map { Date().timeIntervalSince($0) > interval } ?? true
                 let forced = consumeSyncRequest()
                 if due || forced {
                     await engine.syncAll()          // 同步收尾自己会 releasePage
@@ -3327,11 +3671,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { _ in
             Task { @MainActor in
                 let state = AppState.shared
+                MenuController.shared.updateLabel()   // 跨零点实时刷新状态栏剩余天数
                 state.consumeAddDdlHook()
-                await state.refreshLibrary()
+                // 平时打开课程子菜单会按单课惰性刷新；全库兜底扫描仅每 2 小时跑一次
+                let libStale = state.libLastRefresh.map { Date().timeIntervalSince($0) > 2 * 3600 } ?? true
+                if libStale { await state.refreshLibrary() }
                 guard !state.isSyncing else { return }
-                await SyncEngine.shared.keepAlive()   // 30 分钟心跳：续期会话 / 静默重登（不弹窗）
-                let due = state.lastSync.map { Date().timeIntervalSince($0) > 20 * 3600 } ?? false
+                await SyncEngine.shared.keepAlive()   // 30 分钟心跳：原生请求续期 / 静默重登（不弹窗）
+                let interval = TimeInterval(Cfg.syncIntervalMinutes * 60)
+                let due = state.lastSync.map { Date().timeIntervalSince($0) > interval } ?? true
                 let forced = consumeSyncRequest()
                 guard due || forced else { return }
                 await SyncEngine.shared.syncAll()   // syncAll 内部验会话并处理未登录，省一次整页加载
@@ -3462,9 +3810,8 @@ enum LoginVaultUI {
         box.addSubview(pass)
         a.accessoryView = box
         a.window.initialFirstResponder = user
-        NSApp.activate(ignoringOtherApps: true)
 
-        switch a.runModal() {
+        switch showTopAlert(a) {
         case .alertFirstButtonReturn:
             let u = user.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !u.isEmpty, !pass.stringValue.isEmpty else {

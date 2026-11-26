@@ -4,6 +4,7 @@ set -e
 cd "$(dirname "$0")"
 
 APP=CanvasBar
+VERSION=$(tr -d '[:space:]' < VERSION 2>/dev/null || echo 2.15.0)
 BUILD="$PWD/.build"
 APPDIR="$BUILD/$APP.app"
 
@@ -17,7 +18,7 @@ if [ -f AppIcon.icns ]; then
     cp AppIcon.icns "$APPDIR/Contents/Resources/AppIcon.icns"
 fi
 
-cat > "$APPDIR/Contents/Info.plist" <<'PLIST'
+cat > "$APPDIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -27,7 +28,7 @@ cat > "$APPDIR/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleName</key><string>CanvasBar</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>2.14.1</string>
+    <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>LSUIElement</key><true/>
     <key>NSHumanReadableCopyright</key><string>Chester</string>
 </dict>
